@@ -1,0 +1,616 @@
+============================================================
+  QWAK — FiveM Offsets Reference
+  Source: UnknownCheats #340232, pages 1-198 (scraped Apr 2026)
+  Format: all values hex unless noted
+============================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  GLOBAL / MODULE-BASE OFFSETS  (base + offset = ptr)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Build   World        ReplayInterface  ViewPort     Camera       BlipList
+-----   -----------  ---------------  -----------  -----------  -----------
+b1604   0x247F840    0x1EFD4C8        0x2087780    0x2088360    0x0         (page 56)
+b2060   0x24C8858    0x1EC3828        0x1F6A7E0    0x1F6B3C0    0x0         (page 56 — NEW)
+b2189   0x24E6D90    0x1EE18A8        0x1F888C0    0x1F89498    0x0         (page 56 — NEW)
+b2372   0x252DCD8    0x1F05208        0x1F9F5C8    0x1F9E9F0    0x0
+b2545   0x25667E8    0x1F2E7A8        0x1FD6F70    0x1FD7B48    0x1FDF560   (page 56; earlier entry was wrong — used b3095 values)
+b2612   0x2567DB0    0x1F77EF0        0x1FD8570    0x1FD9148    0x0         (page 56 — NEW)
+b2699   0x26684D8    0x20304C8        0x20D8C90    0x20D9868    0x20E1420   (camera: page 56)
+b2802   0x254D448    0x1F5B820        0x1FBC100    0x1FBCCD8    0x1FBD6E0   (camera: page 56)
+b2944   0x257BEA0    0x1F42068        0x1FEAAC0    0x1FEB968    0x1FF3130
+b3095   0x2593320    0x1F58B58        0x20019E0    0x2002888    0x2002FA0   (confirmed bigboypaster + multiple)
+b3258   0x25B14B0    0x1FBD4F0        0x201DBA0    0x201E7D0    0x2023400   (confirmed limonex99, Mouka1337, multiple)
+b3323   0x25C15B0    0x1F85458        0x202DC50    0x202E878    0x0          (page 119 — same as b3337)
+b3337   0x25C15B0    0x1F85458        0x202DC50    0x202E878    0x2008120   ("fix" block, JordanBelford)
+b3407   0x25D7108    0x1F9A9D8        0x20431C0    0x2043DF8    0x2047D50   (prenix2 confirmed)
+b3507   0x25EC580    0x1FB0418        0x2058BA0    0x2059778    0x205E000
+b3570   0x2603908    0x1FC38A8        0x206C060    0x206D1C0    0x206D600   (page 197 — NEW)
+
+Notes:
+  - b1604 Replay corrected to 0x1EFD4C8 (page 56), Camera corrected to 0x2088360
+  - b2545: previous entry was WRONG (had b3095 values). Corrected from page 56.
+  - b3095 camera confirmed as 0x2002888 (NOT 0x20025B8 which is b2545)
+  - b3258 is the most confirmed build on the thread
+  - b3323 = same binary as b3337 per multiple posts
+  - b3570 HandleBullet = 0x102B560; pattern F3 41 0F 10 19 still works
+  - b3751 exists (mentioned page 197) but no offsets confirmed yet
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  PED INTERFACE CHAIN  (from replay ptr)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  b1604 – b3095:
+    pedIface = *(replay + 0x18)
+    pedArr   = *(pedIface + 0x100)
+    count    =  (pedIface + 0x110) as uint16
+
+  b3258 – b3507:  (CHANGED — UC thread confirmed Apr 2026)
+    pedIface = *(replay + 0x100)
+    pedArr   = *(pedIface + 0x108)
+    count    =  (pedIface + 0x118) as uint16
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  PED / CPed MEMBER OFFSETS  (ped + offset)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Field               b1604-b2372   b2545-b2699   b2802+
+-----------------   -----------   -----------   --------
+PlayerInfo (ptr)    0x10C8        0x10A8        0x10A8
+PlayerNetID (int)   0x88          0x88          0xE8
+Health (float)      0x280         0x280         0x280
+MaxHealth (float)   0x2A0         0x284         0x284
+Armor (float)       0x14B8        0x150C        0x150C
+BoneOffset*         0x410         0x410         0x430  (* direct data, NOT a pointer)
+EntityType          0x10B8        0x10B8        0x1098
+FrameFlags          0x0           0x0           0x270
+VisibleFlag         0x2C          0x2C          0x145C   (0x142C on some b2372 builds)
+ConfigFlags         0x1414        0x1414        0x1444
+WeaponManager(ptr)  0x10D8        0x10D8        0x10B8
+VehicleInterface    0xD10         0xD10         0xD10    (last vehicle ptr)
+GodMode (byte)      0x189         0x189         0x189
+Position (Vec3)     0x90          0x90          0x90
+NavMatrix(ptr)      0x30          0x30          0x30     (* + 0x50 = alt pos)
+WorldTransform(ptr) 0x60          0x60          0x60     (ptr to 4x4 float world matrix)
+FragInsNmGTA (ptr)  0x1400        0x1450        0x1430   (b2545-b2699=0x1450 from page 115 enum)
+
+Additional ped fields (constant across b3095+, confirmed cduke01/daniels4n):
+  LastVehicle     = 0xD10
+  VehicleDriver   = 0xC90
+  DoorLock        = 0x13C0
+  SeatBelt        = 0x143C
+  SeatBeltGlass   = 0x1448
+  Stamina         = 0xCF4
+  SpeedModifier   = 0xD40
+  Handling(veh)   = 0x960
+  VehicleState    = 0x972
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  BONE READING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+METHOD 1 — Direct (confirmed working, pages 56/68/90/119/120/163):
+  IMPORTANT: BoneOffset is NOT a pointer — bone data lives INLINE at ped + BoneOffset.
+  worldTransformPtr = *(ped + 0x60)       // ptr to entity 4x4 world transform matrix
+  localBonePos      = ped + BoneOffset + boneIndex * 0x10  // Vec3 in LOCAL space (stride 0x10)
+  worldBonePos      = worldTransformMatrix * localBonePos  // column-major 4x4 float multiply
+
+  BoneOffset (b2802) = 0x410
+  BoneOffset (b2944+)= 0x430   // this is what 'BoneManager' offset resolves to
+
+  Matrix multiply (column-major, 0-indexed):
+    wx = M[0]*bx + M[4]*by + M[ 8]*bz + M[12]
+    wy = M[1]*bx + M[5]*by + M[ 9]*bz + M[13]
+    wz = M[2]*bx + M[6]*by + M[10]*bz + M[14]
+
+METHOD 2 — Tag-based lookup (for GetBoneByTag / aimbot, page 115/163/171):
+  fragInstNm  = *(ped + FragInsNmGTA)    // 0x1430 for b2802+
+  v7          = *(fragInstNm + 0x68)     // confirmed page 115 + page 171 IDA
+  crSkeleton  = *(v7 + 0x178)            // 376 dec = 0x178, confirmed page 171
+  crSkelData  = *(crSkeleton + 0)        // static data: use for tag→index lookup
+  Then: get bone index from tag (hash table walk), then use Method 1 for position.
+
+  IDA decompile (page 171, CDynamicEntity::GetBoneIndexFromBoneTag):
+    v5  = fragInst_vtable->GetFragInst(this)   // = *(ped + 0x1430)
+    v7  = *(_QWORD*)(v5 + 0x68)
+    if v7 && *(_QWORD*)(v5 + 0x78):
+       crSkeleton = *(crSkeleton**)(v7 + 376)  // 376 = 0x178
+
+Matrix stride: 0x10 bytes per bone for local positions (Vec3 + 4 bytes padding)
+Bone TAG hashes (use with GetBonePosW2S / tag-based lookup):
+
+Bone TAG hashes (use with GetBonePosW2S / tag-based lookup):
+  SKEL_Head          = 0x796E
+  SKEL_Neck_1        = 0x9995
+  SKEL_Spine3 (chest)= 0x5FEF     (upper)
+  SKEL_Spine2        = 0x60F0
+  SKEL_Spine1        = 0xE7FF
+  SKEL_Pelvis        = 0x2E28
+  Clavicle_R         = 0x29D2
+  Clavicle_L         = 0xFCD9
+  SKEL_R_Upperarm    = 0x9D4D
+  SKEL_R_Forearm     = 0x6E5C
+  SKEL_R_Hand        = 0xDEAD
+  Elbow_L            = 0x58B7
+  SKEL_L_Upperarm    = 0xB1C5
+  SKEL_L_Forearm     = 0xEEEB
+  SKEL_L_Hand        = 0x49D9
+  SKEL_R_Thigh       = 0xCA72
+  SKEL_R_Calf        = 0x9000
+  SKEL_R_Foot        = 0xCC4D
+  SKEL_L_Thigh       = 0xE39F
+  SKEL_L_Calf        = 0xF9BB
+  SKEL_L_Foot        = 0x3779
+
+Sequential bone INDICES (for array-index-based lookup):
+  0 = Root     1 = Pelvis    2 = Spine0   3 = Spine1   4 = Spine2
+  5 = Chest    6 = Neck      7 = Head
+  8 = R_UpperArm  9 = R_Forearm  10 = R_Hand
+  11 = L_UpperArm 12 = L_Forearm 13 = L_Hand
+  16 = R_Thigh  17 = R_Knee  18 = R_Foot
+  19 = L_Thigh  20 = L_Knee  21 = L_Foot
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  PLAYER NAMES (citizen-playernames-five.dll)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+DLL: citizen-playernames-five.dll
+Data structure: MSVC std::map<int, std::string>  (red-black BST)
+
+Layout at NameDllOff in the DLL's .data section:
+  +0x0: _Myhead  (ptr to sentinel/nil heap node)
+  +0x8: _Mysize  (uint64 count of entries = num players)
+
+From sentinel node:
+  sentinel + 0x8 = tree root (_Parent)
+
+Each BST node (_Tree_node<pair<const int, string>>):
+  +0x00: Left  (ptr)
+  +0x08: Parent(ptr)
+  +0x10: Right (ptr)
+  +0x18: _Color (byte)
+  +0x19: _Isnil (byte)  — skip if == 1 (sentinel)
+  +0x20: key = player network ID (int32)
+  +0x28: std::string value (SSO — chars inline if len < 16)
+  +0x38: string length (uint64)
+
+NameDllOff per build:
+  b1604-b2699: unknown (use ScanNameTable)
+  b2802-b3095: 0x34D28  (older DLL version)
+  b3258+:      0x30D38  (confirmed in use, but scan still needed for exact ver)
+
+Note: The DLL version changes with every FiveM update independently of
+the game build. If 0x30D38 gives garbage, ScanNameTable() will find the
+correct offset by scanning .data sections for the map structure pattern
+and log it as "[Names] Scan found: ... DLL+0x?????"
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  WEAPON OFFSETS  (WeaponManager + 0x20 = current weapon)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Spread          = 0x74
+  Recoil          = 0x2F4
+  Range           = 0x28C
+  ReloadMultiplier= 0x134
+  BulletDamage    = 0xBC     (weapon object)
+  AmmoType        = 0x20
+  AmmoExplosiveType = 0x24
+  WeaponName      = 0x5F0
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  VEHICLE OFFSETS  (vehicle ptr)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  DoorLockState   = 0x13C0
+  BodyHealth      = 0x820
+  TankHealth      = 0x824
+  EngineHealth    = (varies — pattern scan)
+  Driver (ptr)    = 0xC90
+  Handling (ptr)  = 0x960
+  SpeedModifier   = 0xD40
+  VehicleState    = 0x972
+  SeatBelt        = 0x143C
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  MISC / ADDITIONAL MODULE-BASE OFFSETS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+b3258 extras (confirmed limonex99):
+  pointer_to_handle     = base + 0x1639CE8
+  triggerbot/AimedCPed  = base + 0x202C8D0
+  g_bonemask            = base + 0x79EED4
+  handleBullet          = base + 0x101A5F4  (b3258)
+  silentaim_bulletfunc  = base + 0x1044404  (b3258)
+  bIsPlayerAiming       = base + 0x2D3839C  (b3258)
+  PlayerAimingAt        = base + 0x200FA10  (b3258)
+  Waypoint              = base + 0x2022DD0  (b3258)
+  GameplayCamTarget     = base + 0x2002B78  (b3258)
+  GameplayCamHolder     = base + 0x201ED90  (b3258)
+  CanCombatRoll         = base + 0x7072C0   (b3258)
+
+b3095 extras (bigboypaster):
+  pointer_to_handle     = base + 0x1624F80
+  Camera                = base + 0x20025B8  (NOTE: 0x2002888 is also cited)
+  activethreadtls       = 0x161D8F9
+
+b3407 extras:
+  World                 = base + 0x25D7108
+  ReplayInterface pattern: 48 8B 05 ?? ?? ?? ?? 66 89 0D ?? ?? ?? ?? 4C 89 2C D0
+  ServerIP offset       = 0xCD910  (b3407+, was 0xCC910 in b3258)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  PATTERN SIGNATURES  (AOB scans for auto-detection)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+World:
+  48 8B 05 ? ? ? ? 48 8B 48 08 48 85 C9 74 52 8B 81
+
+ReplayInterface (b3407+):
+  48 8B 05 ?? ?? ?? ?? 66 89 0D ?? ?? ?? ?? 4C 89 2C D0
+
+ReplayInterface (general):
+  48 8D 0D ? ? ? ? 89 44 24 30 E8 ? ? ? ? 48 83 C4 28 C3 48 8B 05
+
+Camera:
+  48 8B 05 ? ? ? ? 48 8B 98 ? ? ? ? EB
+
+CameraGameplayDirectory:
+  48 8B 05 ? ? ? ? 38 98 ? ? ? ? 8A C3
+
+Waypoint:
+  48 8D 05 ?? ?? ?? ?? 48 69 C9 B0 00 00 00 48 03 C8 E9 ?? ?? ?? ?? 33 C0
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  TASK / MISC PED FLAGS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  PedTask offset:  0x146B (b1604-b2699)  |  0x144B (b2802-b3095)
+  IsInVehicle:     0x146B (older)  |  check ConfigFlags bit
+
+  enum ePedTask {
+    TASK_NONE    = 0,
+    TASK_FOOT    = 1 << 4,
+    TASK_UNK     = 1 << 5,
+    TASK_DRIVING = 1 << 6
+  };
+
+  eFrameFlag (at ped + 0x270 for b3095+):
+    SuperJump: set/clear via bitfield on m_frame_flags
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  HOW TO FIND OFFSETS YOURSELF
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+World:         scan pattern above, read ptr at [match + 7]
+Camera:        scan pattern above
+ReplayIface:   scan pattern above, or look in thread replies for your build
+Viewport:      ptr near camera in .data section
+Armor:         Cheat Engine — scan float 100.0, set to other value, repeat
+Health:        Cheat Engine — scan float (0-200), take damage, repeat
+BoneManager:   entity + 0x430 for b2802+, entity + 0x410 for older
+PlayerInfo:    entity + 0x10A8 (b2802+)  →  read ptr  →  +0xEC = wantedlevel
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  INVISIBILITY / ALPHA
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Entity alpha byte:  CEntity + 0xAC   (byte, 0=invisible, 255=fully visible)
+  - Confirmed by UC thread (DerDevHD / 0xConrado, post ~#892)
+  - The game resets it +51 every tick back to 255 — write 0 each frame
+  - Works on peds, vehicles, objects (CEntity base class)
+  Usage:    Wr<uint8_t>(ped + 0xAC, 0);    // invisible (write each frame)
+            Wr<uint8_t>(ped + 0xAC, 255);  // visible again
+  Note: CLIENT-SIDE only. Server still sees you unless SET_ENTITY_VISIBLE called.
+  Native: SET_ENTITY_VISIBLE = 0xEA1C610A04DB6BBB
+  Native: GET_ENTITY_ALPHA   = 0x25AE5A122C3F4EB5
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  RAGDOLL
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Function pointer — call to trigger ragdoll (b3258):
+  requestRagdoll = base + 0x11AECD0  (limonex99, confirmed b3258)
+  using ragdoll_t = void*(__fastcall*)(void*);
+  auto fn = (ragdoll_t)(base + 0x11AECD0);
+  fn(localPed);
+
+PedTask offset (freeze / force TASK_NONE):
+  b1604–b2699:   ped + 0x146B
+  b2802–b3095+:  ped + 0x144B
+  Write 0 to clear all tasks immediately (acts like instant ragdoll/freeze).
+  enum ePedTask { TASK_NONE=0, TASK_FOOT=1<<4, TASK_UNK=1<<5, TASK_DRIVING=1<<6 };
+
+  Native: SET_PED_TO_RAGDOLL           = 0xAE99FB955581844A
+  Native: SET_PED_TO_RAGDOLL_WITH_FALL = 0xD76632D99E4966C8
+  Native: CLEAR_PED_TASKS_IMMEDIATELY  = 0xBC045625D2F8E14F
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  ATTACH ENTITY TO ENTITY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+AOB pattern for fpAttachEntityToEntity:
+  48 8B C4 48 89 58 ? 48 89 68 ? 48 89 70 ? 57 41 54 41 55 41 56 41 57
+  48 83 EC ? 0F 29 70 ? 45 0F B7 E1
+
+  using AttachEntityToEntity_t = void(__fastcall*)(
+      uint64_t entity, uint64_t target, int boneIndex,
+      float ox, float oy, float oz, float rx, float ry, float rz,
+      bool softPin, bool collision, bool isPed,
+      int vertexIndex, bool fixedRot, bool p14);
+
+  // Attach object to player's right hand (bone 10):
+  fpAttach(object, localPed, 10, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f,
+           false, false, false, 0, true, false);
+
+  Good attach bones:  Head=7  Chest=5  Pelvis=1  R_Hand=10  L_Hand=13
+
+  Native: ATTACH_ENTITY_TO_ENTITY      = 0x6B9BBD38AB0796DF
+  Native: ATTACH_ENTITY_TO_ENTITY_PHYS = 0x4A04DE7C0B2D3DB8
+  Native: DETACH_ENTITY                = 0x0D3607B71D7B7B2F
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  USEFUL NATIVE HASHES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  SET_ENTITY_VISIBLE               = 0xEA1C610A04DB6BBB
+  GET_ENTITY_ALPHA                 = 0x25AE5A122C3F4EB5
+  SET_ENTITY_ALPHA                 = 0x44A0870B7CEADB09
+  RESET_ENTITY_ALPHA               = 0x9B922739413DCBCF
+  ATTACH_ENTITY_TO_ENTITY          = 0x6B9BBD38AB0796DF
+  ATTACH_ENTITY_TO_ENTITY_PHYS     = 0x4A04DE7C0B2D3DB8
+  DETACH_ENTITY                    = 0x0D3607B71D7B7B2F
+  SET_PED_TO_RAGDOLL               = 0xAE99FB955581844A
+  SET_PED_TO_RAGDOLL_WITH_FALL     = 0xD76632D99E4966C8
+  CLEAR_PED_TASKS_IMMEDIATELY      = 0xBC045625D2F8E14F
+  APPLY_FORCE_TO_ENTITY            = 0xC5F68BE9613E2D18
+  GET_SCREEN_COORD_FROM_WORLD_COORD= 0x34E82F05DF2974F5
+  GET_PED_BONE_INDEX               = 0x3F428D08BE5AAE31
+  GET_PED_BONE_COORDS              = 0x17C07FC640E86B4E
+  IS_ENTITY_ATTACHED               = 0x5C3D0A936FBE53C7
+  IS_ENTITY_ATTACHED_TO_ENTITY     = 0x28FC9F38F035C5B2
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  FREECAM (camera moves, ped stays still)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Camera pointer chain:
+  camera ptr  = *(base + CameraOffset)    // e.g. b3258: base + 0x201E7D0
+  followpedcam = *(camera + 0x3C0)         // CGameplayCameraDirector + 0x3C0
+  viewAngles   = followpedcam + 0x40       // Vec3 yaw/pitch/roll (read/write)
+  crosshairPos = followpedcam + 0x60       // Vec3 where camera looks at
+  cameraPos    = *(camera + 0x3D0)         // Vec3 world position of camera
+                                            // or camera + 0x3D0 as D3DXVECTOR3
+
+  Confirmed by multiple UC posts:
+    D3DXVECTOR3 ViewAngles  = mem.Read<Vec3>(followpedcam + 0x40);
+    D3DXVECTOR3 CamPos      = mem.Read<Vec3>(camera + 0x3D0);
+    D3DXVECTOR3 CrosshairXYZ= mem.Read<Vec3>(followpedcam + 0x60);
+
+  Note: camera + 0x3C0 == same as CamGameplayDirector ptr for some builds.
+    b3095: Camera = 0x2002888, angles at Camera + 0x3C0
+    b3258: Camera = 0x201E7D0, angles at Camera + 0x3C0 (confirmed)
+
+GameplayCamHolder (GameplayCameraDirector):
+  b3258: base + 0x201ED90  (also seen as base + 0x28E5DA — different pointer)
+  Pattern: 4C 89 2D ? ? ? ? E8 ? ? ? ? E8
+  Pattern: 4C 8B 35 ? ? ? ? 33 FF 32 DB
+
+GameplayCamTarget (what camera looks at):
+  b3258: base + 0x2002B78
+  b3095: base + 0x20D9E28
+
+Freecam byte (disables gameplay camera processing):
+  Freecam = base + 0x27BD43   (write 1 = free camera mode)
+
+To implement freecam:
+  1. Save original camera angles
+  2. Write 1 to Freecam offset (or hook camera update)
+  3. Move camera position by writing to cameraPos + 0x3D0
+  4. Ped stays in place because you're not touching nav/position
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  MAGIC BULLET / HANDLE BULLET (silent aim)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+HandleBullet is the function that processes bullet trajectories.
+Hook it to redirect bullets to target position.
+
+Offsets by build (base + offset):
+  b1604:  0xFE7EF8
+  b2372:  0xFF716C
+  b2699:  0xFF9D90
+  b2802:  0x1003F80
+  b2944:  0x100F5A4
+  b3095:  0x100F5A4
+  b3258:  0x101A5F4  (confirmed limonex99)
+  b3258:  0x1044404  (alternative — silentaim::bulletfuncaddr)
+  b3337:  0x102FF8C  (and 0x102B560)
+  b3407:  0x102FF8C  (unconfirmed — use pattern)
+  b3507:  unknown (use pattern)
+
+Patterns (scan in FiveM process):
+  Primary:   F3 41 0F 10 19 F3 41 0F 10 41 04
+  Secondary: 48 8D 45 ?? F3 0F 10 00 F3 0F 10 48 ?? F3 0F 11 45
+  b3407 sig: 48 8B 05 ? ? ? ? 38 98 ? ? ? ? 8A C3
+
+Usage (hook the function, redirect vVelocity):
+  // Bullet struct has vVelocity at offset +24 (3 floats = Vec3)
+  // Hook HandleBullet, read target bone position, overwrite bullet velocity
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  VEHICLE SPAWN & MODIFICATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+CreateVehicle pattern (scan in FiveM process):
+  48 89 5C 24 08 55 56 57 41 54 41 55 41 56 41 57 48 8B EC 48 83 EC 50
+  F3 0F 10 02 F3 0F 10 4A 08 F3 0F 10 5A 10 41 8A C1 33 FF 0F 29 74 24 40
+
+RequestModel pattern:
+  48 89 5C 24 08 48 89 7C 24 20 55 48 8B EC 48 83 EC 50
+
+HasModelLoaded pattern:
+  48 89 5C 24 20 55 56 57 48 8B EC 48 83 EC 20 8B 45 20
+
+Usage:
+  using CreateVehicle_t = uint64_t(__fastcall*)(
+      uint32_t model, float x, float y, float z,
+      float heading, bool isNetwork, bool bScriptHostVeh, bool p7);
+  // Scan AOB → call with vehicle hash + local player position
+
+Common vehicle hashes (examples):
+  Adder (supercar)   = 0xB779A091
+  T20                = 0x6AE6DDA4
+  Oppressor Mk2      = 0x3628BAFA
+  Zentorno           = 0xAB0A6A0C
+  Lazer (jet)        = 0x5BFA5B3B
+  // Full list: search "vehicleHashMap" in pages or use GTA V native DB
+
+Vehicle modification (CVehicle offsets, b3258+):
+  Handling ptr = vehicle + 0x960   → modify speed/accel by writing here
+  BodyHealth   = vehicle + 0x820   (float)
+  TankHealth   = vehicle + 0x824   (float)
+  DoorLock     = vehicle + 0x13C0  (0=unlocked, 2=locked, 10=cannot enter)
+  SpeedMultiplier = vehicle + 0xD40  (float, default 1.0)
+  VehicleState = vehicle + 0x972   (flags)
+
+Native hashes for vehicle features:
+  CREATE_VEHICLE              = 0xAF35D0D2583051B0
+  REQUEST_MODEL               = 0x963D27A58DF860AC
+  HAS_MODEL_LOADED            = 0x98A4EB5D89A0C952
+  SET_VEHICLE_MAX_SPEED       = 0x97FA4F36EB435F78
+  SET_VEHICLE_BODY_HEALTH     = 0xB77D05AC8C78AADB
+  SET_VEHICLE_ENGINE_HEALTH   = 0x45F6D8EEF34ABEF4
+  SET_VEHICLE_FORWARD_SPEED   = 0xAB54A98C6A4AAB1B
+  SET_VEHICLE_MOD             = 0x6AF0636DDEDCB6DD
+  SET_VEHICLE_COLOURS         = 0x57F2008B633F9BA7
+  SET_VEHICLE_EXTRA            = 0x7EE3A3C5E4A40CC9
+  REPAIR_VEHICLE              = 0x115722B1B9C14C1C
+  SET_VEHICLE_INVINCIBLE      = 0xB82717CB90040BFE
+  SET_VEHICLE_NUMBER_PLATE_TEXT = 0x95A88F0B409CDA47
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  TELEPORT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+To teleport local player (write directly to nav component):
+  nav = *(ped + 0x30)          // navigation component ptr
+  Wr<Vec3>(nav + 0x50, pos);   // write new position (same as freecam move)
+  OR:
+  Wr<Vec3>(ped + 0x90, pos);   // direct entity position (less reliable)
+
+To teleport to waypoint:
+  Waypoint offset:
+    b2699:  base + 0x20F9750  (X), + 0x20F9754 (Y)
+    b3095:  base + 0x2022DE0
+    b3258:  base + 0x2022DD0
+  Waypoint pattern: 48 8D 05 ?? ?? ?? ?? 33 D2 48 89 50 F0 48 89 50 F8 48 89 10
+
+Native hashes:
+  SET_ENTITY_COORDS           = 0x06843DA7060A026B
+  GET_ENTITY_COORDS           = 0x3FEF770D40960D5A
+  GET_BLIP_COORDS (waypoint)  = 0x586AFE3FF72D996E
+  SET_WAYPOINT_OFF            = 0xD8E5E9763EF5BFAD
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  RESOURCE LIST / SERVER DUMP
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+DLL: citizen-resources-client.dll
+DLL: citizen-resources-core.dll
+
+Resource cache entry list:
+  Module:  citizen-resources-client.dll
+  Pattern: FF 10 48 8B 08 48 8B 05 ? ? ? ? 48 8B 51 ? 48 83 3C C2 ?
+  Offset within module: 0x5  (after resolving pattern)
+
+  #define RESOURCE_CACHE_ENTRY_LIST_MODULE  "citizen-resources-client.dll"
+  #define RESOURCE_CACHE_ENTRY_LIST_OFFSET  0x5
+  #define CURRENT_RESOURCES_MODULE          "citizen-resources-core.dll"
+
+To enumerate resources:
+  - Hook Stop/Start/ForAll exports in citizen-resources-core.dll
+  - OR walk the resource list via the cache entry pattern above
+  - Each entry contains: resource name (string), resource path, state flags
+
+Note (from thread): "And rn i'm trying to grab them again, but when i use the
+citizen-resources-core.dll and i search for Stop/Start/ForAll, i find nothing,
+FiveM patched this" — so use the pattern scan approach instead.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  LUA CODE EXECUTION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+DLL: citizen-scripting-lua.dll  (or citizen-scripting-lua54.dll)
+
+luaL_loadbufferx hook — the standard method:
+  Pattern in citizen-scripting-lua.dll:  4C 8B DC 53 48 83 EC 60
+  Hook this function to intercept all Lua file loads
+  "Only LoadBufferx seems to get all .lua files" — confirmed UC thread
+
+LoadFileInternal hook (alternative):
+  "LoadFileInternal doesn't get server .lua files"
+  "Figured I could hook LoadFileInternal — gets all .lua files"
+  Pattern search in citizen-scripting-lua.dll for this function
+
+lua_State access:
+  FxLuaRuntime struct (citizen-scripting-lua.dll, offset 0x58):
+    +0x00: fx::LuaStateHolder m_state
+    +0x08: int (__fastcall *m_dbTraceback)(lua_State*)
+  "figured it should be lua_state"
+
+GetNativeHandler pattern:
+  48 89 4C 24 ? 53 48 83 EC 20 48 8B D9 4C 8D 44 24 ?
+
+To execute Lua code in a resource:
+  1. Find the resource's lua_State via LuaStateHolder
+  2. Call luaL_loadbuffer(L, code, strlen(code), "chunk")
+  3. Call lua_pcall(L, 0, 0, 0)
+  WARNING: "Any .text patching in citizen-scripting-lua should get you banned"
+  — hook instead of patch, and avoid resident hooks on adhesive-watched addresses
+
+Key Lua function signatures:
+  luaL_loadbufferx:  IDA search hash then follow call chain
+  lua_pcallk:        offset found via IDA on older unobfuscated GTAV build
+  lua_tolstring:     offset confirmed by multiple thread members
+
+Known DLL offsets (change with every FiveM update; use patterns instead):
+  older version:  LUAL_LOADBUFFERX=0x22CA10  LUA_PCALLK=0x228580  (page 2)
+                  luaL_loadbuffer=0x2BC90                           (page 21)
+  one version:    loadbufferx=0x2BAD0  pcallk=0x2F750               (page 106)
+  one version:    loadbufferx=0x2B260  pcallk=0x2EEE0               (page 122)
+  one version:    luaL_loadbufferx at DLL+0x180065150               (page 24 — absolute)
+
+Pattern alternatives (scan citizen-scripting-lua.dll .text):
+  4C 8B DC 53 48 83 EC 60           (OFFSETS.txt primary — p1)
+  4C 8B D4 53 48 83 EC 60           (p2)
+  40 53 48 83 EC 50 33 C0           (page 22 — NEW; reported working alt pattern)
+  53 48 83 EC 40 4C 8B DA           (p3)
+  also try: LoadBufferX export via GetProcAddress("luaL_loadbufferx")
+
+NativeInvoke usage (calling game natives directly):
+  NativeInvoke::Invoke<0xD80958FC74E988A6, int>(player)  // GET_PLAYER_PED_SCRIPT_INDEX
+  NativeInvoke::Invoke<0x78F0424C34306220, bool>(...)    // SET_PLAYER_HEALTH_RECHARGE_MULT
+  // The template arg is the native hash, return type is the second template param
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  MISC FUNCTION PATTERNS (useful for all features)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+requestRagdoll (b3258):  base + 0x11AECD0
+requestRagdoll NOTE: CANNOT call from DX/render thread — causes crash.
+  Use task clearing (PedTaskOff write 0 + ConfigFlags) instead.
+SetVehicleForwardSpeed:  base addr search "AB54A98C6A4AAB1B" native
+CreateVehicle (AOB):     48 89 5C 24 08 55 56 57 41 54 41 55 41 56 41 57 48 8B EC 48 83 EC 50
+RequestModel (AOB):      48 89 5C 24 08 48 89 7C 24 20 55 48 8B EC 48 83 EC 50
+HasModelLoaded (AOB):    48 89 5C 24 20 55 56 57 48 8B EC 48 83 EC 20 8B 45 20
+HandleBullet (AOB):      F3 41 0F 10 19 F3 41 0F 10 41 04
+HandleBullet (b3570+):   48 8D 45 ?? F3 0F 10 00 F3 0F 10 48 ?? F3 0F 11 45  (page 196 — old pattern fails b3570+)
+GetBoneByIndex (AOB):    48 89 5C 24 ?? 57 48 83 EC 20 8B FA 48 8B D9 E8 ?? ?? ?? ??  (page 192)
+CDynamicEntity::GetBoneIndexFromBoneTag AOB:
+                         48 89 5C 24 ?? 48 89 74 24 ?? 57 48 83 EC ?? 48 8B 01 83 4C 24 30 ??  (page 68)
+fpAttachEntityToEntity:  48 8B C4 48 89 58 ? 48 89 68 ? 48 89 70 ? 57 41 54 41 55 41 56 41 57 48 83 EC ?
+luaL_loadbufferx:        4C 8B DC 53 48 83 EC 60  (in citizen-scripting-lua.dll)
+luaL_loadbufferx alt:    40 53 48 83 EC 50 33 C0  (page 22 — newer DLL)
+resource cache list:     FF 10 48 8B 08 48 8B 05 ? ? ? ? 48 8B 51 ? 48 83 3C C2 ?
+
+============================================================
