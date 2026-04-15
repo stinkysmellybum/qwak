@@ -962,8 +962,11 @@ static void ScanLuaFunctions() {
                 mRanges[nMR++] = {mBase, mi2.SizeOfImage};
             }
 
-            // Pattern scan for luaL_loadbufferx in metadata-lua
-            if(!g_fnLuaLoadBuf) {
+            // Always find loadbufferx inside metadata-lua so the pcall xref scan
+            // can look for its callers within the same DLL. Store in a local var
+            // so we don't clobber g_fnLuaLoadBuf if scripting-lua already set it.
+            uintptr_t metaLoadBuf = 0;
+            {
                 const uint8_t mp1[]={0x4C,0x8B,0xDC,0x53,0x48,0x83,0xEC,0x60};
                 const uint8_t mp2[]={0x4C,0x8B,0xD4,0x53,0x48,0x83,0xEC,0x60};
                 const uint8_t mp3[]={0x53,0x48,0x83,0xEC,0x40,0x4C,0x8B,0xDA};
@@ -976,26 +979,26 @@ static void ScanLuaFunctions() {
                 struct MPI { const uint8_t* b; int n; };
                 const MPI mpats[] = {{mp1,8},{mp2,8},{mp3,8},{mp4,11},{mp5,8},{mp6,8},{mp7,7},{mp8,8},{mp9,11}};
                 for(const auto& pi : mpats) {
-                    for(int ri = 0; ri < nMR && !g_fnLuaLoadBuf; ri++) {
+                    for(int ri = 0; ri < nMR && !metaLoadBuf; ri++) {
                         uintptr_t rs = mRanges[ri].start, re = rs + mRanges[ri].size;
                         for(uintptr_t p = rs; p < re - (uintptr_t)pi.n; p++) {
                             if(!memcmp((void*)p, pi.b, pi.n)){
-                                g_fnLuaLoadBuf = p;
+                                metaLoadBuf = p;
                                 Log("[Lua] loadbufferx in metadata-lua DLL+0x%llX (pattern)", (unsigned long long)(p-mBase));
                                 break;
                             }
                         }
                     }
-                    if(g_fnLuaLoadBuf) break;
+                    if(metaLoadBuf) break;
                 }
                 // Export fallback
-                if(!g_fnLuaLoadBuf) g_fnLuaLoadBuf = (uintptr_t)GetProcAddress(hMeta, "luaL_loadbufferx");
-                if(!g_fnLuaLoadBuf) g_fnLuaLoadBuf = (uintptr_t)GetProcAddress(hMeta, "luaL_loadbuffer");
-                if(g_fnLuaLoadBuf) Log("[Lua] loadbufferx via metadata-lua export");
+                if(!metaLoadBuf) metaLoadBuf = (uintptr_t)GetProcAddress(hMeta, "luaL_loadbufferx");
+                if(!metaLoadBuf) metaLoadBuf = (uintptr_t)GetProcAddress(hMeta, "luaL_loadbuffer");
+                if(metaLoadBuf) Log("[Lua] loadbufferx via metadata-lua export");
                 // getS indirect scan in metadata-lua
-                if(!g_fnLuaLoadBuf) {
+                if(!metaLoadBuf) {
                     const uint8_t gs[]={0x48,0x8B,0x42,0x08,0x48,0x85,0xC0,0x74};
-                    for(int ri = 0; ri < nMR && !g_fnLuaLoadBuf; ri++) {
+                    for(int ri = 0; ri < nMR && !metaLoadBuf; ri++) {
                         uintptr_t rs = mRanges[ri].start, re = rs + mRanges[ri].size;
                         for(uintptr_t p = rs; p < re - 8; p++) {
                             if(memcmp((void*)p, gs, 8)) continue;
@@ -1006,12 +1009,17 @@ static void ScanLuaFunctions() {
                                 if(c == 0xC3 || c == 0xCC || c == 0xC2) { funcStart = p - back + 1; break; }
                             }
                             if(funcStart && !IsBadReadPtr((void*)funcStart, 16)) {
-                                g_fnLuaLoadBuf = funcStart;
+                                metaLoadBuf = funcStart;
                                 Log("[Lua] loadbufferx (getS trace) metadata-lua DLL+0x%llX", (unsigned long long)(funcStart-mBase));
                             }
                             break;
                         }
                     }
+                }
+                // Use metaLoadBuf as g_fnLuaLoadBuf only if scripting-lua didn't provide one
+                if(!g_fnLuaLoadBuf && metaLoadBuf) {
+                    g_fnLuaLoadBuf = metaLoadBuf;
+                    Log("[Lua] g_fnLuaLoadBuf set from metadata-lua");
                 }
             }
 
@@ -1021,21 +1029,23 @@ static void ScanLuaFunctions() {
                 if(!g_fnLuaPcall) g_fnLuaPcall = (uintptr_t)GetProcAddress(hMeta, "lua_pcallk");
                 if(g_fnLuaPcall) Log("[Lua] pcall via metadata-lua export");
             }
-            // pcall xref from loadbufferx callers in metadata-lua
-            if(!g_fnLuaPcall && g_fnLuaLoadBuf) {
+            // pcall xref from loadbufferx callers *within metadata-lua*.
+            // Use metaLoadBuf (always a metadata-lua address) so the scan finds
+            // callers inside the same DLL, regardless of where g_fnLuaLoadBuf came from.
+            if(!g_fnLuaPcall && metaLoadBuf) {
                 for(int ri = 0; ri < nMR && !g_fnLuaPcall; ri++) {
                     uintptr_t rs = mRanges[ri].start, re = rs + mRanges[ri].size;
                     for(uintptr_t p = rs; p < re - 5; p++) {
                         uint8_t* b = (uint8_t*)p;
                         if(b[0] != 0xE8) continue;
                         uintptr_t tgt = p + 5 + (int32_t)(b[1]|(b[2]<<8)|(b[3]<<16)|(b[4]<<24));
-                        if(tgt != g_fnLuaLoadBuf) continue;
+                        if(tgt != metaLoadBuf) continue;
                         for(uintptr_t q = p+5; q < p+100 && q < re-5; q++) {
                             uint8_t* s = (uint8_t*)q;
                             if(s[0]==0xC3||s[0]==0xC2) break;
                             if(s[0]==0xE8) {
                                 uintptr_t cand = q+5+(int32_t)(s[1]|(s[2]<<8)|(s[3]<<16)|(s[4]<<24));
-                                if(cand >= rs && cand < re && cand != g_fnLuaLoadBuf) {
+                                if(cand >= rs && cand < re && cand != metaLoadBuf) {
                                     g_fnLuaPcall = cand;
                                     Log("[Lua] pcall xref in metadata-lua DLL+0x%llX", (unsigned long long)(cand-mBase));
                                     break;
@@ -1082,9 +1092,11 @@ static void ScanLuaFunctions() {
                 }
             }
 
-            if(g_fnLuaLoadBuf && !g_fnLuaBpLoadBuf) {
+            // If pcall is from metadata-lua it won't fire during normal gameplay,
+            // so use settop as the exec trigger instead.
+            if(g_fnLuaPcall >= mBase && g_fnLuaPcall < mBase + 0x800000 /*~max DLL size*/) {
                 g_usingMetadataLua = true;
-                Log("[Lua] Using metadata-lua for Lua calls (settop will be used as exec trigger)");
+                Log("[Lua] pcall from metadata-lua -- settop will be exec trigger");
             }
         }
     }
