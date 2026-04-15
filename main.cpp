@@ -14,6 +14,7 @@
 #include <string>
 #include <stdarg.h>
 #include <algorithm> // for std::min_element, std::max_element
+#include <unordered_map>
 #include <TlHelp32.h> // for thread enumeration (HW breakpoint hook)
 
 #pragma comment(lib, "d3d11.lib")
@@ -2287,6 +2288,11 @@ static void DrawESP() {
 
     int drawn = 0, sNull = 0, sLocal = 0, sPos = 0, sHp = 0, sW2S = 0, sNpc = 0;
 
+    // Last-known-position cache: when a ped's position is transiently (0,0,0)
+    // (e.g. streamed out briefly by the server), fall back to the last valid pos
+    // so the ESP box stays visible instead of flickering off.
+    static std::unordered_map<uintptr_t, Vec3> s_lkpPos;
+
     for(uint16_t i = 0; i < count; i++) {
         uintptr_t ped = RdPtr(pedArr + (uintptr_t)i * 0x10);
         // Fallback: if offset 0x0 is null, try offset 0x8 (some builds store pointer there)
@@ -2300,7 +2306,17 @@ static void DrawESP() {
         // Server ID is only used for labeling, not filtering
 
         Vec3 pos = GetPos(ped);
-        if(pos.x == 0.f && pos.y == 0.f && pos.z == 0.f) { sPos++; continue; }
+        if(pos.x == 0.f && pos.y == 0.f && pos.z == 0.f) {
+            // Ped streamed out briefly -- use last known position if available
+            auto it = s_lkpPos.find(ped);
+            if(it != s_lkpPos.end()) {
+                pos = it->second;
+            } else {
+                sPos++; continue;
+            }
+        } else {
+            s_lkpPos[ped] = pos;
+        }
 
         float hp = Rd<float>(ped + g_current_offsets->Health);
 
@@ -2584,33 +2600,64 @@ static void TickAimbot() {
         if(score < bestDist) { bestDist = score; bestPed = ped; bestSx = sx; bestSy = sy; }
     }
 
-    g_aimTarget_early = bestPed;
-    if(!bestPed) return;
+    // Smoothing state — persists across frames
+    static float     s_smoothSx  = 0.f, s_smoothSy = 0.f; // EMA position
+    static float     s_accumX    = 0.f, s_accumY   = 0.f; // sub-pixel accumulator
+    static uintptr_t s_lastPed   = 0;                      // detect target change
 
-    // Mouse-based aiming: set deltas for RawInput hook, then nudge input pipeline
+    if(!bestPed) {
+        // No target — reset everything so the next lock-on is clean
+        g_aimTarget_early = 0;
+        s_lastPed  = 0;
+        s_accumX   = s_accumY = 0.f;
+        return;
+    }
+    g_aimTarget_early = bestPed;
+
+    // On target change, snap EMA to the new target immediately so the aimbot
+    // doesn't slowly drift from the old one to the new one.
+    if(bestPed != s_lastPed) {
+        s_smoothSx = bestSx;
+        s_smoothSy = bestSy;
+        s_accumX   = s_accumY = 0.f;
+        s_lastPed  = bestPed;
+    } else {
+        // EMA: blend toward real target each frame.
+        // Alpha 0.35 keeps ~35% new sample + 65% history.
+        // This filters single-frame bone-animation jitter without adding
+        // perceivable lag on fast-moving targets.
+        const float ema = 0.35f;
+        s_smoothSx += (bestSx - s_smoothSx) * ema;
+        s_smoothSy += (bestSy - s_smoothSy) * ema;
+    }
+
     if(g_aimbot && g_origRID) {
-        float rawDx = bestSx - cx;
-        float rawDy = bestSy - cy;
-        float mag = sqrtf(rawDx*rawDx + rawDy*rawDy);
-        if(mag > 0.5f) {
-            LONG dx, dy;
-            if(mag < 3.f) {
-                dx = rawDx > 0.f ? 1 : (rawDx < 0.f ? -1 : 0);
-                dy = rawDy > 0.f ? 1 : (rawDy < 0.f ? -1 : 0);
-            } else {
-                dx = (LONG)(rawDx * g_aimbotSmooth);
-                dy = (LONG)(rawDy * g_aimbotSmooth);
-                if(dx == 0 && rawDx > 0.f) dx = 1;
-                if(dx == 0 && rawDx < 0.f) dx = -1;
-                if(dy == 0 && rawDy > 0.f) dy = 1;
-                if(dy == 0 && rawDy < 0.f) dy = -1;
+        float rawDx = s_smoothSx - cx;
+        float rawDy = s_smoothSy - cy;
+        float mag   = sqrtf(rawDx*rawDx + rawDy*rawDy);
+
+        // Dead zone: already within 1.5 px — stop rather than oscillate
+        if(mag < 1.5f) {
+            s_accumX = s_accumY = 0.f;
+        } else {
+            // Accumulate fractional pixels so integer truncation doesn't discard
+            // the remainder each frame (the old code's main source of jitter).
+            s_accumX += rawDx * g_aimbotSmooth;
+            s_accumY += rawDy * g_aimbotSmooth;
+
+            LONG dx = (LONG)s_accumX;
+            LONG dy = (LONG)s_accumY;
+            s_accumX -= (float)dx; // carry sub-pixel remainder into next frame
+            s_accumY -= (float)dy;
+
+            if(dx != 0 || dy != 0) {
+                InterlockedExchange(&g_aimDeltaX, dx);
+                InterlockedExchange(&g_aimDeltaY, dy);
+                // Nudge: generate a zero-movement mouse event so the game calls
+                // GetRawInputData (which our hook intercepts to inject the deltas).
+                // mouse_event is a legacy API that FiveM does not block.
+                mouse_event(MOUSEEVENTF_MOVE, 0, 0, 0, 0);
             }
-            InterlockedExchange(&g_aimDeltaX, dx);
-            InterlockedExchange(&g_aimDeltaY, dy);
-            // Nudge: generate a zero-movement mouse event so the game calls
-            // GetRawInputData (which our hook intercepts to inject the deltas).
-            // mouse_event is a legacy API that FiveM does not block.
-            mouse_event(MOUSEEVENTF_MOVE, 0, 0, 0, 0);
         }
     }
 }
@@ -2947,6 +2994,13 @@ static void ApplyFeatures() {
             g_tpTarget = {wp.x, wp.y, tpZ};
             g_tpFrames = 15;
             SetPedPos(ped, g_tpTarget);
+            // Lua native updates the network layer so the server accepts the move.
+            // Direct memory writes alone get corrected back by server-side AC.
+            char luaTp[128];
+            snprintf(luaTp, sizeof(luaTp),
+                "SetEntityCoords(PlayerPedId(),%.2f,%.2f,%.2f,false,false,false,true)",
+                wp.x, wp.y, tpZ);
+            ExecLua(luaTp);
             Log("[TP] Teleported to waypoint: (%.1f, %.1f, %.1f)", wp.x, wp.y, tpZ);
         }
     }
@@ -3446,6 +3500,11 @@ if(g_gameReady) {
                                 g_tpTarget = {pos2.x+1.f, pos2.y+1.f, pos2.z+0.5f};
                                 g_tpFrames = 15;
                                 SetPedPos(localPed2, g_tpTarget);
+                                char luaTp2[128];
+                                snprintf(luaTp2, sizeof(luaTp2),
+                                    "SetEntityCoords(PlayerPedId(),%.2f,%.2f,%.2f,false,false,false,true)",
+                                    pos2.x+1.f, pos2.y+1.f, pos2.z+0.5f);
+                                ExecLua(luaTp2);
                             }
                         }
                         if(ImGui::MenuItem("  Spectate")) {
@@ -3520,6 +3579,11 @@ if(g_gameReady) {
                             g_tpTarget = {pos2.x+1.f, pos2.y+1.f, pos2.z+0.5f};
                             g_tpFrames = 15;
                             SetPedPos(localPed2, g_tpTarget);
+                            char luaTp3[128];
+                            snprintf(luaTp3, sizeof(luaTp3),
+                                "SetEntityCoords(PlayerPedId(),%.2f,%.2f,%.2f,false,false,false,true)",
+                                pos2.x+1.f, pos2.y+1.f, pos2.z+0.5f);
+                            ExecLua(luaTp3);
                         }
                     }
 
