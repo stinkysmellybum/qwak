@@ -1107,13 +1107,13 @@ static int __fastcall HkLuaLoadBufX(void* L, const char* buf, size_t sz,
             combined.reserve(code.size() + 80 + (origOk ? sz : 0));
             combined += "local _ok,_er=pcall(function()\n";
             combined += code;
-            combined += "\nend) if not _ok then print('[QWAK]'.._er) end\n";
+            combined += "\nend) if not _ok then print('[QWAK]'..tostring(_er)) end\n";
             if(origOk) combined.append(buf, sz);
         } catch(...) {
             Log("[Lua] ERROR: string build failed, running code only");
             combined = "local _ok,_er=pcall(function()\n";
             combined += code;
-            combined += "\nend) if not _ok then print('[QWAK]'.._er) end\n";
+            combined += "\nend) if not _ok then print('[QWAK]'..tostring(_er)) end\n";
         }
 
         Log("[Lua] Buffer injection done (%zu bytes total).", combined.size());
@@ -1139,7 +1139,10 @@ static uintptr_t     g_aimTarget_early  = 0;
 
 // Simple file log for crash diagnostics (survives game close)
 static void FLog(const char* fmt, ...) {
-    FILE* f = fopen("C:\\Users\\stink\\Desktop\\qwak_lua.log", "a");
+    char logPath[MAX_PATH];
+    GetTempPathA(MAX_PATH, logPath);
+    strcat_s(logPath, "qwak_lua.log");
+    FILE* f = fopen(logPath, "a");
     if(!f) return;
     va_list a; va_start(a,fmt); vfprintf(f,fmt,a); va_end(a);
     fprintf(f, "\n"); fflush(f); fclose(f);
@@ -1165,15 +1168,17 @@ static void DoLuaDeferred() {
         int pcRet = ((Pcallk_t)g_fnLuaPcall)(L, 0, 0, 0, 0, nullptr);
         FLog("pcall=%d", pcRet);
         Log("[Lua] pcall=%d", pcRet);
-        if(pcRet != 0) {
+        if(pcRet != 0 && g_fnLuaSettop) {
             // Pop error message to keep Lua stack clean
             using Settop_t = void(__fastcall*)(void*, int);
             ((Settop_t)g_fnLuaSettop)(L, -2);
         }
     } else {
         // Pop error from failed load
-        using Settop_t = void(__fastcall*)(void*, int);
-        ((Settop_t)g_fnLuaSettop)(L, -2);
+        if(g_fnLuaSettop) {
+            using Settop_t = void(__fastcall*)(void*, int);
+            ((Settop_t)g_fnLuaSettop)(L, -2);
+        }
         FLog("loadbufferx FAILED (%d)", loadRet);
         Log("[Lua] load FAILED (%d)", loadRet);
     }
@@ -1358,7 +1363,15 @@ static void ExecLua(const char* code){
 
     if(!g_fnLuaLoadBuf) { Log("[Lua] No loadbufferx found"); FLog("ABORT: no loadbufferx"); return; }
     if(!g_fnLuaPcall)   { Log("[Lua] No pcall found"); FLog("ABORT: no pcall"); return; }
-    if(!g_fnLuaSettop)  { Log("[Lua] No settop"); FLog("ABORT: no settop"); return; }
+    if(!g_fnLuaSettop)  { Log("[Lua] Warning: no settop -- error stack cleanup disabled"); FLog("Warning: no settop"); }
+    // Ensure VEH handler is installed before arming any breakpoint
+    if(!g_vehHandle) {
+        g_vehHandle = AddVectoredExceptionHandler(1, LuaVehHandler);
+        Log("[Lua] VEH handler installed (from ExecLua)");
+        FLog("VEH installed from ExecLua");
+    }
+    if(!g_vehHandle) { Log("[Lua] VEH install FAILED"); FLog("ABORT: VEH install failed"); return; }
+
     InitTrampoline();
     if(!g_trampCode) { Log("[Lua] Trampoline alloc failed"); FLog("ABORT: no trampoline"); return; }
 
@@ -1370,6 +1383,7 @@ static void ExecLua(const char* code){
     // Store in pre-allocated buffer (render thread — safe to malloc here)
     if(g_luaExecBuf) { free(g_luaExecBuf); g_luaExecBuf = nullptr; }
     g_luaExecBuf = (char*)malloc(buf.size() + 1);
+    if(!g_luaExecBuf) { Log("[Lua] malloc failed"); FLog("ABORT: malloc failed"); return; }
     memcpy(g_luaExecBuf, buf.c_str(), buf.size() + 1);
     g_luaExecSz = buf.size();
 
