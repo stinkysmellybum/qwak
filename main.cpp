@@ -2976,23 +2976,8 @@ static void ApplyFeatures() {
             Log("[Spawn] ERROR: Invalid ped position, cannot spawn");
         } else {
         Log("[Spawn] Model: %s | Position: (%.1f, %.1f, %.1f)", g_spawnModel, sp.x+5.f, sp.y, sp.z+1.f);
-        char lua[768];
-        snprintf(lua, sizeof(lua),
-            "Citizen.CreateThread(function()\n"
-            "  local h=joaat('%s')\n"
-            "  if h == 0 then h=GetHashKey('%s') end\n"
-            "  RequestModel(h)\n"
-            "  local maxWait = 5000\n"
-            "  while not HasModelLoaded(h) and maxWait > 0 do Citizen.Wait(10) maxWait=maxWait-10 end\n"
-            "  if HasModelLoaded(h) then\n"
-            "    CreateVehicle(h,%.1f,%.1f,%.1f,0.0,true,false)\n"
-            "    SetModelAsNoLongerNeeded(h)\n"
-            "    TriggerEvent('chat:addMessage',{args={'QWAK','Vehicle spawned!'}})\n"
-            "  else\n"
-            "    TriggerEvent('chat:addMessage',{args={'QWAK','Failed to load model'}})\n"
-            "  end\n"
-            "end)\n",
-            g_spawnModel, g_spawnModel, sp.x+5.f, sp.y, sp.z+1.f);
+        // TEST: just print to F8 console to confirm Lua fires before doing anything
+        const char* lua = "print('[QWAK] Lua test fired OK')";
         Log("[Spawn] *** CALLING ExecLua() ***");
         ExecLua(lua);
         Log("[Spawn] ========== COMPLETE ==========\n");
