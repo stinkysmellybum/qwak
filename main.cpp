@@ -393,13 +393,14 @@ static uintptr_t g_fnAttachEntity   = 0; // fpAttachEntityToEntity
 //      capture lua_State when FiveM loads/reloads any script.
 //   4. Once lua_State is captured, ExecLua calls loadbufferx+pcall directly â€“
 //      no need to wait for another script load.
-static HMODULE   g_hLuaDll       = nullptr;
-static uintptr_t g_fnLuaLoadBuf  = 0;  // luaL_loadbufferx (pattern scan) -- for CALLING
-static uintptr_t g_fnLuaPcall    = 0;  // lua_pcall        (xref from caller)
-static uintptr_t g_fnLuaBpLoadBuf= 0;  // scripting-lua loadbufferx (HWBP target only)
-static void*     g_luaState      = nullptr;
-static bool      g_luaHooked     = false;
-static bool      g_luaEarlyDone  = false;
+static HMODULE   g_hLuaDll         = nullptr;
+static uintptr_t g_fnLuaLoadBuf    = 0;  // luaL_loadbufferx (pattern scan) -- for CALLING
+static uintptr_t g_fnLuaPcall      = 0;  // lua_pcall        (xref from caller)
+static uintptr_t g_fnLuaBpLoadBuf  = 0;  // scripting-lua loadbufferx (HWBP target only)
+static void*     g_luaState        = nullptr;
+static bool      g_luaHooked       = false;
+static bool      g_luaEarlyDone    = false;
+static bool      g_usingMetadataLua= false; // true when loadbuf/pcall are from metadata-lua
 static std::string g_luaQueue;
 
 using LuaLBX_t  = int(__fastcall*)(void*,const char*,size_t,const char*,const char*);
@@ -564,12 +565,14 @@ static void ScanLuaFunctions() {
                 Log("[Lua] Candidate DLL+0x%llX REJECTED: no CALL found", (unsigned long long)(cand-base));
                 return false;
             }
-            // Check 5th param access [RSP+0x28] or [RSP+0x30]
+            // Check 5th param access [RSP+offset] where offset >= 0x28 (mode parameter)
+            // After any sub rsp,N the original [RSP+0x28] is now at [RSP+0x28+N].
+            // Scan wider (256 bytes) and accept any aligned offset >= 0x28.
             bool has5thParam = false;
-            for(int i = 0; i < 80 && i < funcLen - 4; i++) {
+            for(int i = 0; i < 256 && i < funcLen - 4; i++) {
                 uint8_t* b = (uint8_t*)(cand + i);
-                // MOV reg,[RSP+0x28/0x30] patterns
-                if(b[3] == 0x24 && (b[4] == 0x28 || b[4] == 0x30 || b[4] == 0x48 || b[4] == 0x50)) {
+                // MOV reg,[RSP+disp] or MOV [RSP+disp],reg with disp >= 0x28
+                if(b[3] == 0x24 && b[4] >= 0x28) {
                     if((b[0] == 0x44 || b[0] == 0x48 || b[0] == 0x4C) && (b[1] == 0x8B || b[1] == 0x89)) {
                         has5thParam = true; break;
                     }
@@ -1079,8 +1082,10 @@ static void ScanLuaFunctions() {
                 }
             }
 
-            if(g_fnLuaLoadBuf && !g_fnLuaBpLoadBuf)
-                Log("[Lua] Using metadata-lua for Lua calls (state capture via scripting-lua HWBP)");
+            if(g_fnLuaLoadBuf && !g_fnLuaBpLoadBuf) {
+                g_usingMetadataLua = true;
+                Log("[Lua] Using metadata-lua for Lua calls (settop will be used as exec trigger)");
+            }
         }
     }
 }
@@ -1277,7 +1282,7 @@ static LONG CALLBACK LuaVehHandler(PEXCEPTION_POINTERS pEx) {
             return EXCEPTION_CONTINUE_EXECUTION;
         }
 
-        // Hit on lua_settop: capture state only (no exec — pcallk handles that)
+        // Hit on lua_settop: capture state, and run deferred exec via trampoline when pending
         if(g_fnLuaSettop && addr == g_fnLuaSettop) {
             static int s_stHits = 0;
             s_stHits++;
@@ -1292,11 +1297,23 @@ static LONG CALLBACK LuaVehHandler(PEXCEPTION_POINTERS pEx) {
                 Log("[Lua] State captured: %p", L);
             }
 
-            // Disable DR0 — settop is only for state capture, pcallk handles exec
+            // Disable DR0 on this context (one-shot; ExecLua re-arms for next call)
             pEx->ContextRecord->Dr0 = 0;
             pEx->ContextRecord->Dr7 &= ~1ULL;
-            // Single-step past to keep BP alive for state capture during init
-            if(!g_luaState) {
+
+            // Deferred exec: hijack settop's return address so DoLuaDeferred runs
+            // after settop finishes (Lua stack is consistent at that point).
+            if(g_luaExecPending && g_trampCode && L) {
+                g_luaExecPending = false;
+                g_trampL = L;
+                uintptr_t* rsp = (uintptr_t*)pEx->ContextRecord->Rsp;
+                g_trampOrigRet = *rsp;
+                *rsp = (uintptr_t)g_trampCode;
+                FLog("settop trampoline: origRet=%llX L=%p",
+                    (unsigned long long)g_trampOrigRet, L);
+                Log("[Lua] settop hijacked -> trampoline (L=%p)", L);
+            } else if(!g_luaState) {
+                // State not yet captured: single-step to keep BP alive for next hit
                 pEx->ContextRecord->EFlags |= 0x100;
                 g_settopRearmStep = true;
             }
@@ -1390,9 +1407,16 @@ static void ExecLua(const char* code){
     Log("[Lua] Queued %zu bytes for Lua thread (state=%p)", buf.size(), g_luaState);
     FLog("Queued %zu bytes, state=%p", buf.size(), g_luaState);
     g_luaExecPending = true;
-    // Arm BP on pcallk in metadata-lua — called every Lua tick, fires almost immediately
-    SetHardwareBP(g_fnLuaPcall);
-    Log("[Lua] BP armed on pcallk (%llX) for deferred exec", (unsigned long long)g_fnLuaPcall);
+    if(g_usingMetadataLua) {
+        // metadata-lua pcall is only invoked during resource loading, never on a Lua tick.
+        // Use settop (from scripting-lua) as the trigger — it fires every frame.
+        if(!g_fnLuaSettop) { Log("[Lua] No settop trigger available"); FLog("ABORT: no settop trigger"); g_luaExecPending = false; return; }
+        SetHardwareBP(g_fnLuaSettop);
+        Log("[Lua] BP armed on settop (%llX) for deferred exec (metadata-lua path)", (unsigned long long)g_fnLuaSettop);
+    } else {
+        SetHardwareBP(g_fnLuaPcall);
+        Log("[Lua] BP armed on pcallk (%llX) for deferred exec", (unsigned long long)g_fnLuaPcall);
+    }
 }
 static bool g_gameReady     = false;
 
