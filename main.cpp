@@ -370,6 +370,7 @@ static bool  g_vehRepair     = false;
 static bool  g_vehBoost      = false;
 static float g_vehBoostMult  = 1.5f;
 static bool  g_vehLock       = false;
+static bool  g_vehUnlock     = false;
 // Teleport
 static bool  g_tpWaypoint    = false;
 // Spawn
@@ -1299,7 +1300,7 @@ static LONG CALLBACK LuaVehHandler(PEXCEPTION_POINTERS pEx) {
         if(g_fnLuaSettop && addr == g_fnLuaSettop) {
             static int s_stHits = 0;
             s_stHits++;
-            if(s_stHits <= 3) {
+            if(s_stHits <= 5) {
                 FLog("settop hit #%d L=%p", s_stHits, (void*)pEx->ContextRecord->Rcx);
                 Log("[Lua] settop BP hit #%d L=%p", s_stHits, (void*)pEx->ContextRecord->Rcx);
             }
@@ -1310,25 +1311,37 @@ static LONG CALLBACK LuaVehHandler(PEXCEPTION_POINTERS pEx) {
                 Log("[Lua] State captured: %p", L);
             }
 
-            // Disable DR0 on this context (one-shot; ExecLua re-arms for next call)
-            pEx->ContextRecord->Dr0 = 0;
-            pEx->ContextRecord->Dr7 &= ~1ULL;
-
-            // Deferred exec: hijack settop's return address so DoLuaDeferred runs
-            // after settop finishes (Lua stack is consistent at that point).
             if(g_luaExecPending && g_trampCode && L) {
-                g_luaExecPending = false;
-                g_trampL = L;
-                uintptr_t* rsp = (uintptr_t*)pEx->ContextRecord->Rsp;
-                g_trampOrigRet = *rsp;
-                *rsp = (uintptr_t)g_trampCode;
-                FLog("settop trampoline: origRet=%llX L=%p",
-                    (unsigned long long)g_trampOrigRet, L);
-                Log("[Lua] settop hijacked -> trampoline (L=%p)", L);
-            } else if(!g_luaState) {
-                // State not yet captured: single-step to keep BP alive for next hit
-                pEx->ContextRecord->EFlags |= 0x100;
-                g_settopRearmStep = true;
+                // Only hijack when the state matches what we captured -- calling scripting-lua's
+                // loadbufferx with a state from a different Lua VM returns garbage.
+                if(L == g_luaState) {
+                    pEx->ContextRecord->Dr0 = 0;
+                    pEx->ContextRecord->Dr7 &= ~1ULL;
+                    g_luaExecPending = false;
+                    g_trampL = L;
+                    uintptr_t* rsp = (uintptr_t*)pEx->ContextRecord->Rsp;
+                    g_trampOrigRet = *rsp;
+                    *rsp = (uintptr_t)g_trampCode;
+                    FLog("settop trampoline: origRet=%llX L=%p",
+                        (unsigned long long)g_trampOrigRet, L);
+                    Log("[Lua] settop hijacked -> trampoline (L=%p)", L);
+                } else {
+                    // Wrong Lua VM -- single-step to re-arm BP and wait for the right state
+                    FLog("settop skip: L=%p != captured=%p, rearm", L, g_luaState);
+                    pEx->ContextRecord->Dr0 = 0;
+                    pEx->ContextRecord->Dr7 &= ~1ULL;
+                    pEx->ContextRecord->EFlags |= 0x100;
+                    g_settopRearmStep = true;
+                }
+            } else {
+                // No pending exec: disarm (state already captured or not needed)
+                pEx->ContextRecord->Dr0 = 0;
+                pEx->ContextRecord->Dr7 &= ~1ULL;
+                if(!g_luaState) {
+                    // State not yet captured: single-step to re-arm for next hit
+                    pEx->ContextRecord->EFlags |= 0x100;
+                    g_settopRearmStep = true;
+                }
             }
             return EXCEPTION_CONTINUE_EXECUTION;
         }
@@ -2626,7 +2639,7 @@ static void TickAimbot() {
         // Alpha 0.35 keeps ~35% new sample + 65% history.
         // This filters single-frame bone-animation jitter without adding
         // perceivable lag on fast-moving targets.
-        const float ema = 0.35f;
+        const float ema = 0.18f;
         s_smoothSx += (bestSx - s_smoothSx) * ema;
         s_smoothSy += (bestSy - s_smoothSy) * ema;
     }
@@ -2637,7 +2650,7 @@ static void TickAimbot() {
         float mag   = sqrtf(rawDx*rawDx + rawDy*rawDy);
 
         // Dead zone: already within 1.5 px — stop rather than oscillate
-        if(mag < 1.5f) {
+        if(mag < 3.5f) {
             s_accumX = s_accumY = 0.f;
         } else {
             // Accumulate fractional pixels so integer truncation doesn't discard
@@ -2957,9 +2970,23 @@ static void ApplyFeatures() {
         if(AddrOk(pi)) Wr<uint32_t>(pi + 0xEC, 0);
     }
 
-    //  invisibility â€” use both alpha byte (client) and Lua SET_ENTITY_VISIBLE (server) 
-    if(g_invisible) {
-        Wr<uint8_t>(ped + 0xAC, 0); // client-side alpha
+    //  invisibility: alpha byte every frame (client-side), Lua every ~3s (server-side)
+    {
+        static bool s_wasInvis = false;
+        static int  s_invTick  = 0;
+        if(g_invisible) {
+            Wr<uint8_t>(ped + 0xAC, 0); // client-side: game resets each tick so write every frame
+            if(g_luaState && ++s_invTick >= 180) {
+                s_invTick = 0;
+                ExecLua(“SetEntityVisible(PlayerPedId(),false,false)”);
+            }
+            s_wasInvis = true;
+        } else if(s_wasInvis) {
+            s_wasInvis = false;
+            s_invTick  = 0;
+            Wr<uint8_t>(ped + 0xAC, 255);
+            if(g_luaState) ExecLua(“SetEntityVisible(PlayerPedId(),true,false)”);
+        }
     }
 
     //  anti-ragdoll: ConfigFlags only (FragInsNmGTA kept intact for bone reading)
@@ -3020,12 +3047,13 @@ static void ApplyFeatures() {
         if(g_vehBoost) {
             Wr<float>(veh + 0xD40, g_vehBoostMult);
         }
-        if(g_vehLock) Wr<int>(veh + 0x13C0, 2);
+        if(g_vehLock) { Wr<int>(veh + 0x13C0, 2); }
+        if(g_vehUnlock) { g_vehUnlock = false; Wr<int>(veh + 0x13C0, 0); }
     }
 
-    //  speed boost (ped on foot) 
+    //  speed boost (on foot: write SpeedModifier to last vehicle even when outside)
     if(g_speedBoost && !AddrOk(veh)) {
-        // speed boost handled via velocity if needed
+        // SpeedModifier requires being in a vehicle - use g_vehBoost instead
     }
 
     //  vehicle spawn 
@@ -3399,6 +3427,7 @@ if(g_gameReady) {
                 Toggle("##vboost","Speed Boost",&g_vehBoost);
                 if(g_vehBoost){ ImGui::SetNextItemWidth(-1); ImGui::SliderFloat("##vbm",&g_vehBoostMult,1.f,10.f,"%.1fx"); }
                 Toggle("##vlock","Lock Doors",&g_vehLock);
+                if(ImGui::Button("Unlock Doors (one-shot)",{-1,22})) g_vehUnlock=true;
                 ImGui::Unindent(8);
                 SectionLabel("SPAWN"); ImGui::Indent(8);
                 ImGui::SetNextItemWidth(-1);
