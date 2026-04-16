@@ -2825,7 +2825,10 @@ static void ScanFunctions() {
 static void SetPedPos(uintptr_t ped, Vec3 pos) {
     // Write to both nav component and direct position for reliability
     uintptr_t nav = RdPtr(ped + 0x30);
-    if(AddrOk(nav)) Wr<Vec3>(nav + 0x50, pos);
+    if(AddrOk(nav)) {
+        Wr<Vec3>(nav + 0x50, pos);
+        Wr<Vec3>(nav + 0x10, {0.f, 0.f, 0.f}); // zero velocity to prevent physics snap-back
+    }
     Wr<Vec3>(ped + 0x90, pos);
 }
 
@@ -2970,22 +2973,17 @@ static void ApplyFeatures() {
         if(AddrOk(pi)) Wr<uint32_t>(pi + 0xEC, 0);
     }
 
-    //  invisibility: alpha byte every frame (client-side), Lua every ~3s (server-side)
+    //  invisibility: alpha byte every frame (client-side render only)
+    //  NOTE: SetEntityVisible via Lua is server-monitorable and detectable by Adhesive.
+    //  Alpha write is client-side only and not network-visible.
     {
         static bool s_wasInvis = false;
-        static int  s_invTick  = 0;
         if(g_invisible) {
-            Wr<uint8_t>(ped + 0xAC, 0); // client-side: game resets each tick so write every frame
-            if(g_luaState && ++s_invTick >= 180) {
-                s_invTick = 0;
-                ExecLua(“SetEntityVisible(PlayerPedId(),false,false)”);
-            }
+            Wr<uint8_t>(ped + 0xAC, 0); // game resets to 255 each tick, write every frame
             s_wasInvis = true;
         } else if(s_wasInvis) {
             s_wasInvis = false;
-            s_invTick  = 0;
             Wr<uint8_t>(ped + 0xAC, 255);
-            if(g_luaState) ExecLua(“SetEntityVisible(PlayerPedId(),true,false)”);
         }
     }
 
@@ -3021,13 +3019,6 @@ static void ApplyFeatures() {
             g_tpTarget = {wp.x, wp.y, tpZ};
             g_tpFrames = 15;
             SetPedPos(ped, g_tpTarget);
-            // Lua native updates the network layer so the server accepts the move.
-            // Direct memory writes alone get corrected back by server-side AC.
-            char luaTp[128];
-            snprintf(luaTp, sizeof(luaTp),
-                "SetEntityCoords(PlayerPedId(),%.2f,%.2f,%.2f,false,false,false,true)",
-                wp.x, wp.y, tpZ);
-            ExecLua(luaTp);
             Log("[TP] Teleported to waypoint: (%.1f, %.1f, %.1f)", wp.x, wp.y, tpZ);
         }
     }
@@ -3529,11 +3520,6 @@ if(g_gameReady) {
                                 g_tpTarget = {pos2.x+1.f, pos2.y+1.f, pos2.z+0.5f};
                                 g_tpFrames = 15;
                                 SetPedPos(localPed2, g_tpTarget);
-                                char luaTp2[128];
-                                snprintf(luaTp2, sizeof(luaTp2),
-                                    "SetEntityCoords(PlayerPedId(),%.2f,%.2f,%.2f,false,false,false,true)",
-                                    pos2.x+1.f, pos2.y+1.f, pos2.z+0.5f);
-                                ExecLua(luaTp2);
                             }
                         }
                         if(ImGui::MenuItem("  Spectate")) {
@@ -3608,11 +3594,6 @@ if(g_gameReady) {
                             g_tpTarget = {pos2.x+1.f, pos2.y+1.f, pos2.z+0.5f};
                             g_tpFrames = 15;
                             SetPedPos(localPed2, g_tpTarget);
-                            char luaTp3[128];
-                            snprintf(luaTp3, sizeof(luaTp3),
-                                "SetEntityCoords(PlayerPedId(),%.2f,%.2f,%.2f,false,false,false,true)",
-                                pos2.x+1.f, pos2.y+1.f, pos2.z+0.5f);
-                            ExecLua(luaTp3);
                         }
                     }
 
