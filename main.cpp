@@ -14,6 +14,7 @@
 #include <string>
 #include <stdarg.h>
 #include <algorithm> // for std::min_element, std::max_element
+#include <unordered_map>
 #include <TlHelp32.h> // for thread enumeration (HW breakpoint hook)
 
 #pragma comment(lib, "d3d11.lib")
@@ -369,6 +370,7 @@ static bool  g_vehRepair     = false;
 static bool  g_vehBoost      = false;
 static float g_vehBoostMult  = 1.5f;
 static bool  g_vehLock       = false;
+static bool  g_vehUnlock     = false;
 // Teleport
 static bool  g_tpWaypoint    = false;
 // Spawn
@@ -1298,7 +1300,7 @@ static LONG CALLBACK LuaVehHandler(PEXCEPTION_POINTERS pEx) {
         if(g_fnLuaSettop && addr == g_fnLuaSettop) {
             static int s_stHits = 0;
             s_stHits++;
-            if(s_stHits <= 3) {
+            if(s_stHits <= 5) {
                 FLog("settop hit #%d L=%p", s_stHits, (void*)pEx->ContextRecord->Rcx);
                 Log("[Lua] settop BP hit #%d L=%p", s_stHits, (void*)pEx->ContextRecord->Rcx);
             }
@@ -1309,25 +1311,37 @@ static LONG CALLBACK LuaVehHandler(PEXCEPTION_POINTERS pEx) {
                 Log("[Lua] State captured: %p", L);
             }
 
-            // Disable DR0 on this context (one-shot; ExecLua re-arms for next call)
-            pEx->ContextRecord->Dr0 = 0;
-            pEx->ContextRecord->Dr7 &= ~1ULL;
-
-            // Deferred exec: hijack settop's return address so DoLuaDeferred runs
-            // after settop finishes (Lua stack is consistent at that point).
             if(g_luaExecPending && g_trampCode && L) {
-                g_luaExecPending = false;
-                g_trampL = L;
-                uintptr_t* rsp = (uintptr_t*)pEx->ContextRecord->Rsp;
-                g_trampOrigRet = *rsp;
-                *rsp = (uintptr_t)g_trampCode;
-                FLog("settop trampoline: origRet=%llX L=%p",
-                    (unsigned long long)g_trampOrigRet, L);
-                Log("[Lua] settop hijacked -> trampoline (L=%p)", L);
-            } else if(!g_luaState) {
-                // State not yet captured: single-step to keep BP alive for next hit
-                pEx->ContextRecord->EFlags |= 0x100;
-                g_settopRearmStep = true;
+                // Only hijack when the state matches what we captured -- calling scripting-lua's
+                // loadbufferx with a state from a different Lua VM returns garbage.
+                if(L == g_luaState) {
+                    pEx->ContextRecord->Dr0 = 0;
+                    pEx->ContextRecord->Dr7 &= ~1ULL;
+                    g_luaExecPending = false;
+                    g_trampL = L;
+                    uintptr_t* rsp = (uintptr_t*)pEx->ContextRecord->Rsp;
+                    g_trampOrigRet = *rsp;
+                    *rsp = (uintptr_t)g_trampCode;
+                    FLog("settop trampoline: origRet=%llX L=%p",
+                        (unsigned long long)g_trampOrigRet, L);
+                    Log("[Lua] settop hijacked -> trampoline (L=%p)", L);
+                } else {
+                    // Wrong Lua VM -- single-step to re-arm BP and wait for the right state
+                    FLog("settop skip: L=%p != captured=%p, rearm", L, g_luaState);
+                    pEx->ContextRecord->Dr0 = 0;
+                    pEx->ContextRecord->Dr7 &= ~1ULL;
+                    pEx->ContextRecord->EFlags |= 0x100;
+                    g_settopRearmStep = true;
+                }
+            } else {
+                // No pending exec: disarm (state already captured or not needed)
+                pEx->ContextRecord->Dr0 = 0;
+                pEx->ContextRecord->Dr7 &= ~1ULL;
+                if(!g_luaState) {
+                    // State not yet captured: single-step to re-arm for next hit
+                    pEx->ContextRecord->EFlags |= 0x100;
+                    g_settopRearmStep = true;
+                }
             }
             return EXCEPTION_CONTINUE_EXECUTION;
         }
@@ -2287,6 +2301,11 @@ static void DrawESP() {
 
     int drawn = 0, sNull = 0, sLocal = 0, sPos = 0, sHp = 0, sW2S = 0, sNpc = 0;
 
+    // Last-known-position cache: when a ped's position is transiently (0,0,0)
+    // (e.g. streamed out briefly by the server), fall back to the last valid pos
+    // so the ESP box stays visible instead of flickering off.
+    static std::unordered_map<uintptr_t, Vec3> s_lkpPos;
+
     for(uint16_t i = 0; i < count; i++) {
         uintptr_t ped = RdPtr(pedArr + (uintptr_t)i * 0x10);
         // Fallback: if offset 0x0 is null, try offset 0x8 (some builds store pointer there)
@@ -2300,7 +2319,17 @@ static void DrawESP() {
         // Server ID is only used for labeling, not filtering
 
         Vec3 pos = GetPos(ped);
-        if(pos.x == 0.f && pos.y == 0.f && pos.z == 0.f) { sPos++; continue; }
+        if(pos.x == 0.f && pos.y == 0.f && pos.z == 0.f) {
+            // Ped streamed out briefly -- use last known position if available
+            auto it = s_lkpPos.find(ped);
+            if(it != s_lkpPos.end()) {
+                pos = it->second;
+            } else {
+                sPos++; continue;
+            }
+        } else {
+            s_lkpPos[ped] = pos;
+        }
 
         float hp = Rd<float>(ped + g_current_offsets->Health);
 
@@ -2584,33 +2613,64 @@ static void TickAimbot() {
         if(score < bestDist) { bestDist = score; bestPed = ped; bestSx = sx; bestSy = sy; }
     }
 
-    g_aimTarget_early = bestPed;
-    if(!bestPed) return;
+    // Smoothing state — persists across frames
+    static float     s_smoothSx  = 0.f, s_smoothSy = 0.f; // EMA position
+    static float     s_accumX    = 0.f, s_accumY   = 0.f; // sub-pixel accumulator
+    static uintptr_t s_lastPed   = 0;                      // detect target change
 
-    // Mouse-based aiming: set deltas for RawInput hook, then nudge input pipeline
+    if(!bestPed) {
+        // No target — reset everything so the next lock-on is clean
+        g_aimTarget_early = 0;
+        s_lastPed  = 0;
+        s_accumX   = s_accumY = 0.f;
+        return;
+    }
+    g_aimTarget_early = bestPed;
+
+    // On target change, snap EMA to the new target immediately so the aimbot
+    // doesn't slowly drift from the old one to the new one.
+    if(bestPed != s_lastPed) {
+        s_smoothSx = bestSx;
+        s_smoothSy = bestSy;
+        s_accumX   = s_accumY = 0.f;
+        s_lastPed  = bestPed;
+    } else {
+        // EMA: blend toward real target each frame.
+        // Alpha 0.35 keeps ~35% new sample + 65% history.
+        // This filters single-frame bone-animation jitter without adding
+        // perceivable lag on fast-moving targets.
+        const float ema = 0.18f;
+        s_smoothSx += (bestSx - s_smoothSx) * ema;
+        s_smoothSy += (bestSy - s_smoothSy) * ema;
+    }
+
     if(g_aimbot && g_origRID) {
-        float rawDx = bestSx - cx;
-        float rawDy = bestSy - cy;
-        float mag = sqrtf(rawDx*rawDx + rawDy*rawDy);
-        if(mag > 0.5f) {
-            LONG dx, dy;
-            if(mag < 3.f) {
-                dx = rawDx > 0.f ? 1 : (rawDx < 0.f ? -1 : 0);
-                dy = rawDy > 0.f ? 1 : (rawDy < 0.f ? -1 : 0);
-            } else {
-                dx = (LONG)(rawDx * g_aimbotSmooth);
-                dy = (LONG)(rawDy * g_aimbotSmooth);
-                if(dx == 0 && rawDx > 0.f) dx = 1;
-                if(dx == 0 && rawDx < 0.f) dx = -1;
-                if(dy == 0 && rawDy > 0.f) dy = 1;
-                if(dy == 0 && rawDy < 0.f) dy = -1;
+        float rawDx = s_smoothSx - cx;
+        float rawDy = s_smoothSy - cy;
+        float mag   = sqrtf(rawDx*rawDx + rawDy*rawDy);
+
+        // Dead zone: already within 1.5 px — stop rather than oscillate
+        if(mag < 3.5f) {
+            s_accumX = s_accumY = 0.f;
+        } else {
+            // Accumulate fractional pixels so integer truncation doesn't discard
+            // the remainder each frame (the old code's main source of jitter).
+            s_accumX += rawDx * g_aimbotSmooth;
+            s_accumY += rawDy * g_aimbotSmooth;
+
+            LONG dx = (LONG)s_accumX;
+            LONG dy = (LONG)s_accumY;
+            s_accumX -= (float)dx; // carry sub-pixel remainder into next frame
+            s_accumY -= (float)dy;
+
+            if(dx != 0 || dy != 0) {
+                InterlockedExchange(&g_aimDeltaX, dx);
+                InterlockedExchange(&g_aimDeltaY, dy);
+                // Nudge: generate a zero-movement mouse event so the game calls
+                // GetRawInputData (which our hook intercepts to inject the deltas).
+                // mouse_event is a legacy API that FiveM does not block.
+                mouse_event(MOUSEEVENTF_MOVE, 0, 0, 0, 0);
             }
-            InterlockedExchange(&g_aimDeltaX, dx);
-            InterlockedExchange(&g_aimDeltaY, dy);
-            // Nudge: generate a zero-movement mouse event so the game calls
-            // GetRawInputData (which our hook intercepts to inject the deltas).
-            // mouse_event is a legacy API that FiveM does not block.
-            mouse_event(MOUSEEVENTF_MOVE, 0, 0, 0, 0);
         }
     }
 }
@@ -2765,7 +2825,10 @@ static void ScanFunctions() {
 static void SetPedPos(uintptr_t ped, Vec3 pos) {
     // Write to both nav component and direct position for reliability
     uintptr_t nav = RdPtr(ped + 0x30);
-    if(AddrOk(nav)) Wr<Vec3>(nav + 0x50, pos);
+    if(AddrOk(nav)) {
+        Wr<Vec3>(nav + 0x50, pos);
+        Wr<Vec3>(nav + 0x10, {0.f, 0.f, 0.f}); // zero velocity to prevent physics snap-back
+    }
     Wr<Vec3>(ped + 0x90, pos);
 }
 
@@ -2910,9 +2973,18 @@ static void ApplyFeatures() {
         if(AddrOk(pi)) Wr<uint32_t>(pi + 0xEC, 0);
     }
 
-    //  invisibility â€” use both alpha byte (client) and Lua SET_ENTITY_VISIBLE (server) 
-    if(g_invisible) {
-        Wr<uint8_t>(ped + 0xAC, 0); // client-side alpha
+    //  invisibility: alpha byte every frame (client-side render only)
+    //  NOTE: SetEntityVisible via Lua is server-monitorable and detectable by Adhesive.
+    //  Alpha write is client-side only and not network-visible.
+    {
+        static bool s_wasInvis = false;
+        if(g_invisible) {
+            Wr<uint8_t>(ped + 0xAC, 0); // game resets to 255 each tick, write every frame
+            s_wasInvis = true;
+        } else if(s_wasInvis) {
+            s_wasInvis = false;
+            Wr<uint8_t>(ped + 0xAC, 255);
+        }
     }
 
     //  anti-ragdoll: ConfigFlags only (FragInsNmGTA kept intact for bone reading)
@@ -2966,12 +3038,13 @@ static void ApplyFeatures() {
         if(g_vehBoost) {
             Wr<float>(veh + 0xD40, g_vehBoostMult);
         }
-        if(g_vehLock) Wr<int>(veh + 0x13C0, 2);
+        if(g_vehLock) { Wr<int>(veh + 0x13C0, 2); }
+        if(g_vehUnlock) { g_vehUnlock = false; Wr<int>(veh + 0x13C0, 0); }
     }
 
-    //  speed boost (ped on foot) 
+    //  speed boost (on foot: write SpeedModifier to last vehicle even when outside)
     if(g_speedBoost && !AddrOk(veh)) {
-        // speed boost handled via velocity if needed
+        // SpeedModifier requires being in a vehicle - use g_vehBoost instead
     }
 
     //  vehicle spawn 
@@ -3345,6 +3418,7 @@ if(g_gameReady) {
                 Toggle("##vboost","Speed Boost",&g_vehBoost);
                 if(g_vehBoost){ ImGui::SetNextItemWidth(-1); ImGui::SliderFloat("##vbm",&g_vehBoostMult,1.f,10.f,"%.1fx"); }
                 Toggle("##vlock","Lock Doors",&g_vehLock);
+                if(ImGui::Button("Unlock Doors (one-shot)",{-1,22})) g_vehUnlock=true;
                 ImGui::Unindent(8);
                 SectionLabel("SPAWN"); ImGui::Indent(8);
                 ImGui::SetNextItemWidth(-1);
