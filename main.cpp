@@ -1464,16 +1464,9 @@ static void ExecLua(const char* code){
         SetHardwareBP(g_fnLuaPcall);
         Log("[Lua] BP armed on pcall for deferred exec");
     }
-
-    // Trigger BP immediately by calling lua_settop on the captured state
-    // This ensures the hijack fires without waiting for a natural function call
-    if(g_luaState && g_fnLuaSettop) {
-        using Settop_t = void(__fastcall*)(void*, int);
-        Log("[Lua] Triggering settop BP with state=%p", g_luaState);
-        FLog("Trigger settop: %p", g_luaState);
-        ((Settop_t)g_fnLuaSettop)(g_luaState, 0);
-        Log("[Lua] settop call completed");
-    }
+    // BP will fire on the next natural call from the Lua scripting thread.
+    // Do NOT call lua_settop from here — that would run DoLuaDeferred on the
+    // render thread, which causes garbage returns from Lua API (not thread-safe).
 }
 static bool g_gameReady     = false;
 
