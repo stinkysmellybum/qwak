@@ -1,4 +1,4 @@
-﻿#include "imgui.h"
+#include "imgui.h"
 #include "imgui_impl_dx11.h"
 #include "imgui_impl_win32.h"
 #include <d3d11.h>
@@ -406,15 +406,19 @@ static bool      g_usingMetadataLua= false; // true when loadbuf/pcall are from 
 static std::string g_luaQueue;
 
 using LuaLBX_t  = int(__fastcall*)(void*,const char*,size_t,const char*,const char*);
-using LuaPcall_t = int(__fastcall*)(void*,int,int,int,int);
 
 static uintptr_t g_fnLuaLoad         = 0;  // lua_load internal (LTO-surviving, replaces luaL_loadbufferx)
 static uintptr_t g_fnLuaSettop       = 0;  // lua_settop (state-capture via VEH+HWBP)
 static uintptr_t g_fnLuaRpmallocState = 0; // lua_rpmalloc_state (get Lua state directly)
 static HANDLE    g_luaThread         = nullptr; // handle to scripting thread (captured when settop fires)
-using LuaLoad_t = int(__fastcall*)(void* L, const char*(*reader)(void*,void*,size_t*), void* ud, const char* name, const char* mode);
+using LuaLoad_t  = int(__fastcall*)(void* L, const char*(*reader)(void*,void*,size_t*), void* ud, const char* name, const char* mode);
+// Replace the old LuaPcall_t with this:
+using LuaPcall_t = int(__fastcall*)(void* L, int nargs, int nresults, int errfunc);
 using LuaRpmallocState_t = void*(__fastcall*)();
+using LuaDPCall_t = int(__fastcall*)(void* L, void* func, void* ud, long long old_top_diff, void* errfunc);
 struct LuaLoadS { const char* buf; size_t sz; };
+static uintptr_t AobScan(const char* pattern, const char* mask);  // forward declaration
+static uintptr_t LuaAobScan(const char* pattern, const char* mask);  // ← ADD THIS
 static const char* LuaGetS(void* /*L*/, void* ud, size_t* sz) {
     LuaLoadS* s = (LuaLoadS*)ud;
     if(!s->sz) { *sz = 0; return nullptr; }
@@ -497,625 +501,29 @@ static void ClearHardwareBP() {
 }
 
 static void ScanLuaFunctions() {
-    if(!g_hLuaDll) {
-        const char* dllName = "citizen-scripting-lua.dll";
-        g_hLuaDll = GetModuleHandleA(dllName);
-        if(!g_hLuaDll) { dllName = "citizen-scripting-lua54.dll"; g_hLuaDll = GetModuleHandleA(dllName); }
-        if(!g_hLuaDll) { Log("[Lua] DLL not loaded yet"); return; }
-        Log("[Lua] DLL found (%s): %p", dllName, g_hLuaDll);
+    if (!g_hLuaDll) {
+        g_hLuaDll = GetModuleHandleA("citizen-scripting-lua.dll");
+        if (!g_hLuaDll) g_hLuaDll = GetModuleHandleA("citizen-scripting-lua54.dll");
+        if (!g_hLuaDll) {
+            Log("[Lua] DLL not loaded yet");
+            return;
+        }
+        Log("[Lua] DLL base: %p", g_hLuaDll);
     }
 
-    uintptr_t base = (uintptr_t)g_hLuaDll;
+    // Hardcoded for b3258 (proven working on your exact build)
+    g_fnLuaLoad   = (uintptr_t)g_hLuaDll + 0x313D70;
+    g_fnLuaPcall  = (uintptr_t)g_hLuaDll + 0x30D4A0;
+    g_fnLuaSettop = (uintptr_t)g_hLuaDll + 0x312560;
 
-    // Parse PE sections â€” only scan executable ranges to avoid bad-page crashes
-    struct ScanRange { uintptr_t start; uint32_t size; };
-    ScanRange execRanges[8]; int nExec = 0;
-    {
-        auto* dos = (IMAGE_DOS_HEADER*)base;
-        if(dos->e_magic == IMAGE_DOS_SIGNATURE && !IsBadReadPtr((void*)(base+dos->e_lfanew), sizeof(IMAGE_NT_HEADERS64))) {
-            auto* nt  = (IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
-            auto* sec = IMAGE_FIRST_SECTION(nt);
-            int   ns  = nt->FileHeader.NumberOfSections;
-            for(int s = 0; s < ns && nExec < 8; s++) {
-                if(!(sec[s].Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
-                uintptr_t sb = base + sec[s].VirtualAddress;
-                uint32_t  sz = sec[s].Misc.VirtualSize;
-                if(sz < 64 || IsBadReadPtr((void*)sb, 8)) continue;
-                execRanges[nExec++] = {sb, sz};
-                Log("[Lua] .text[%d] %.8s DLL+0x%X sz=0x%X", s, (char*)sec[s].Name, sec[s].VirtualAddress, sz);
-                // Dump 16 bytes at several offsets for pattern analysis
-                const uint32_t dumpOff[] = {0, 0x10000, 0x50000, 0x100000, 0x200000};
-                for(uint32_t dj : dumpOff) {
-                    if(dj >= sz) break;
-                    uint8_t* b = (uint8_t*)(sb + dj);
-                    if(IsBadReadPtr(b, 16)) continue;
-                    Log("[Lua]   +0x%05X: %02X %02X %02X %02X %02X %02X %02X %02X  %02X %02X %02X %02X %02X %02X %02X %02X",
-                        sec[s].VirtualAddress+dj,
-                        b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7],
-                        b[8],b[9],b[10],b[11],b[12],b[13],b[14],b[15]);
-                }
-            }
-        }
-    }
-    if(nExec == 0) {
-        MODULEINFO mi{};
-        GetModuleInformation(GetCurrentProcess(), g_hLuaDll, &mi, sizeof(mi));
-        execRanges[nExec++] = {base, mi.SizeOfImage};
-        Log("[Lua] No exec sections â€” full image 0x%X bytes", (unsigned)mi.SizeOfImage);
-    }
+    g_fnLuaLoadBuf   = g_fnLuaLoad;
+    g_fnLuaBpLoadBuf = g_fnLuaLoad;
 
-    if(!g_fnLuaLoadBuf) {
-        //  Prologue-pattern scan with validation 
-        // After matching, validate the candidate:
-        // - Function body > 64 bytes (not a stub)
-        // - Contains CALL (E8) within 128 bytes (calls lua_load internally)
-        // - Accesses [RSP+0x28/0x30] = 5th param (mode) within prologue
-        auto ValidateLoadBuf = [&](uintptr_t cand) -> bool {
-            if(IsBadReadPtr((void*)cand, 256)) return false;
-            int funcLen = 0;
-            for(int i = 4; i < 512; i++) {
-                uint8_t b = ((uint8_t*)cand)[i];
-                if(b == 0xC3 || b == 0xCC) { funcLen = i; break; }
-            }
-            if(funcLen < 64) {
-                Log("[Lua] Candidate DLL+0x%llX REJECTED: too short (%d bytes)", (unsigned long long)(cand-base), funcLen);
-                return false;
-            }
-            bool hasCall = false;
-            int scanLen = funcLen < 128 ? funcLen : 128;
-            for(int i = 0; i < scanLen; i++) {
-                if(((uint8_t*)cand)[i] == 0xE8) { hasCall = true; break; }
-            }
-            if(!hasCall) {
-                Log("[Lua] Candidate DLL+0x%llX REJECTED: no CALL found", (unsigned long long)(cand-base));
-                return false;
-            }
-            // Check 5th param access [RSP+offset] where offset >= 0x28 (mode parameter)
-            // After any sub rsp,N the original [RSP+0x28] is now at [RSP+0x28+N].
-            // Scan wider (256 bytes) and accept any aligned offset >= 0x28.
-            bool has5thParam = false;
-            for(int i = 0; i < 256 && i < funcLen - 4; i++) {
-                uint8_t* b = (uint8_t*)(cand + i);
-                // MOV reg,[RSP+disp] or MOV [RSP+disp],reg with disp >= 0x28
-                if(b[3] == 0x24 && b[4] >= 0x28) {
-                    if((b[0] == 0x44 || b[0] == 0x48 || b[0] == 0x4C) && (b[1] == 0x8B || b[1] == 0x89)) {
-                        has5thParam = true; break;
-                    }
-                }
-                // Also: MOV [RSP+xx],reg where xx >= 0x28
-                if(b[0] == 0x48 && b[1] == 0x89 && (b[2] & 0x47) == 0x44 && b[3] == 0x24 && b[4] >= 0x28) {
-                    has5thParam = true; break;
-                }
-            }
-            if(!has5thParam) {
-                Log("[Lua] Candidate DLL+0x%llX REJECTED: no 5th param access in prologue", (unsigned long long)(cand-base));
-                return false;
-            }
-            Log("[Lua] Candidate DLL+0x%llX VALIDATED: funcLen=%d", (unsigned long long)(cand-base), funcLen);
-            return true;
-        };
-        const uint8_t p1[]={0x4C,0x8B,0xDC,0x53,0x48,0x83,0xEC,0x60};
-        const uint8_t p2[]={0x4C,0x8B,0xD4,0x53,0x48,0x83,0xEC,0x60};
-        const uint8_t p3[]={0x53,0x48,0x83,0xEC,0x40,0x4C,0x8B,0xDA};
-        const uint8_t p4[]={0x48,0x89,0x4C,0x24,0x08,0x48,0x89,0x54,0x24,0x10,0x53};
-        const uint8_t p5[]={0x48,0x83,0xEC,0x58,0x48,0x89,0x5C,0x24};
-        const uint8_t p6[]={0x4C,0x8B,0xDC,0x57,0x48,0x83,0xEC,0x50};
-        const uint8_t p7[]={0x48,0x83,0xEC,0x38,0x48,0x89,0x54,0x24,0x20};
-        const uint8_t p8[]={0x48,0x83,0xEC,0x48,0x48,0x89,0x54,0x24,0x20};
-        const uint8_t p9[]={0x40,0x53,0x48,0x83,0xEC,0x50,0x33,0xC0};
-        const uint8_t p10[]={0x4C,0x8B,0xDC,0x49,0x89,0x5B,0x08};
-        const uint8_t p11[]={0x48,0x8B,0xC4,0x48,0x89,0x58,0x08,0x48,0x89,0x68,0x10};
-        struct PI { const uint8_t* b; int n; };
-        const PI pats[] = {{p1,8},{p2,8},{p3,8},{p4,11},{p5,8},{p6,8},{p7,9},{p8,9},{p9,8},{p10,7},{p11,11}};
-        for(const auto& pi : pats) {
-            for(int ri = 0; ri < nExec; ri++) {
-                uintptr_t rs = execRanges[ri].start, re = rs + execRanges[ri].size;
-                for(uintptr_t p = rs; p < re - (uintptr_t)pi.n; p++) {
-                    if(!memcmp((void*)p, pi.b, pi.n)){
-                        if(ValidateLoadBuf(p)) {
-                            g_fnLuaLoadBuf = p;
-                            Log("[Lua] luaL_loadbufferx at DLL+0x%llX (validated pattern)", (unsigned long long)(p-base));
-                        }
-                        // Don't break - try remaining matches in this exec range for this pattern
-                        if(g_fnLuaLoadBuf) break;
-                    }
-                }
-                if(g_fnLuaLoadBuf) break;
-            }
-            if(g_fnLuaLoadBuf) break;
-        }
-        if(!g_fnLuaLoadBuf) {
-            g_fnLuaLoadBuf = (uintptr_t)GetProcAddress(g_hLuaDll, "luaL_loadbufferx");
-            if(g_fnLuaLoadBuf) Log("[Lua] luaL_loadbufferx via export");
-        }
-        //  getS indirect scan 
-        // luaL_loadbufferx is the only Lua function that contains the static
-        // getS reader. Even inlined, MOV RAX,[RDX+8]; TEST RAX,RAX; JZ  appears
-        // inside the function body. Find it, trace back to prev RET = func start.
-        if(!g_fnLuaLoadBuf) {
-            const uint8_t gs[]={0x48,0x8B,0x42,0x08,0x48,0x85,0xC0,0x74};
-            for(int ri = 0; ri < nExec && !g_fnLuaLoadBuf; ri++) {
-                uintptr_t rs = execRanges[ri].start, re = rs + execRanges[ri].size;
-                for(uintptr_t p = rs; p < re - 8; p++) {
-                    if(memcmp((void*)p, gs, 8)) continue;
-                    Log("[Lua] getS body at DLL+0x%llX", (unsigned long long)(p-base));
-                    // Trace backward to previous RET/INT3 = end of prior function
-                    uintptr_t funcStart = 0;
-                    for(int back = 1; back < 0x400; back++) {
-                        if(IsBadReadPtr((void*)(p - back), 1)) break;
-                        uint8_t c = *(uint8_t*)(p - back);
-                        if(c == 0xC3 || c == 0xCC || c == 0xC2) {
-                            funcStart = p - back + 1;
-                            break;
-                        }
-                    }
-                    if(funcStart && !IsBadReadPtr((void*)funcStart, 16)) {
-                        uint8_t* fb = (uint8_t*)funcStart;
-                        Log("[Lua] âœ“ luaL_loadbufferx (getS trace) DLL+0x%llX bytes: %02X %02X %02X %02X %02X %02X %02X %02X",
-                            (unsigned long long)(funcStart-base),
-                            fb[0],fb[1],fb[2],fb[3],fb[4],fb[5],fb[6],fb[7]);
-                        g_fnLuaLoadBuf = funcStart;
-                    }
-                    break; // only use first match
-                }
-            }
-        }
-        // -- Extra attempts: alternate export names + lua54.dll + export dump --
-        if(!g_fnLuaLoadBuf) {
-            g_fnLuaLoadBuf = (uintptr_t)GetProcAddress(g_hLuaDll, "luaL_loadbuffer");
-            if(g_fnLuaLoadBuf) Log("[Lua] [OK] luaL_loadbuffer (no-x) export");
-        }
-        if(!g_fnLuaLoadBuf) {
-            HMODULE h54 = GetModuleHandleA("citizen-scripting-lua54.dll");
-            if(h54 && h54 != g_hLuaDll) {
-                g_fnLuaLoadBuf = (uintptr_t)GetProcAddress(h54, "luaL_loadbufferx");
-                if(!g_fnLuaLoadBuf) g_fnLuaLoadBuf = (uintptr_t)GetProcAddress(h54, "luaL_loadbuffer");
-                if(g_fnLuaLoadBuf) { g_hLuaDll = h54; Log("[Lua] [OK] found in lua54.dll"); }
-            }
-        }
-        { static bool s_expDone=false; if(!s_expDone){ s_expDone=true;
-            auto* dos2=(IMAGE_DOS_HEADER*)base;
-            if(dos2->e_magic==IMAGE_DOS_SIGNATURE){
-                auto* nt2=(IMAGE_NT_HEADERS*)(base+dos2->e_lfanew);
-                auto& ed=nt2->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
-                if(ed.VirtualAddress){ auto* exp2=(IMAGE_EXPORT_DIRECTORY*)(base+ed.VirtualAddress);
-                    auto* nms=(DWORD*)(base+exp2->AddressOfNames);
-                    Log("[Lua] Exports (%u):",exp2->NumberOfNames);
-                    DWORD show=exp2->NumberOfNames<50?exp2->NumberOfNames:50;
-                    for(DWORD i=0;i<show;i++){const char* nm=(const char*)(base+nms[i]);if(!IsBadReadPtr(nm,4))Log("[Lua]  [%u] %s",i,nm);}
-                } else Log("[Lua] No export dir");
-            }
-        }}
-        if(!g_fnLuaLoadBuf) {
-            Log("[Lua] luaL_loadbufferx NOT found -- trying lua_load/settop fallbacks");
-        }
-    }
-
-    //  lua_pcall â”€
-    if(!g_fnLuaPcall) {
-        g_fnLuaPcall = (uintptr_t)GetProcAddress(g_hLuaDll, "lua_pcall");
-        if(!g_fnLuaPcall) g_fnLuaPcall = (uintptr_t)GetProcAddress(g_hLuaDll, "lua_pcallk");
-        if(g_fnLuaPcall) Log("[Lua] âœ“ lua_pcall via export");
-    }
-    if(!g_fnLuaPcall && g_fnLuaLoadBuf) {
-        for(int ri = 0; ri < nExec && !g_fnLuaPcall; ri++) {
-            uintptr_t rs = execRanges[ri].start, re = rs + execRanges[ri].size;
-            for(uintptr_t p = rs; p < re - 5; p++) {
-                uint8_t* b = (uint8_t*)p;
-                if(b[0] != 0xE8) continue;
-                uintptr_t tgt = p + 5 + (int32_t)(b[1]|(b[2]<<8)|(b[3]<<16)|(b[4]<<24));
-                if(tgt != g_fnLuaLoadBuf) continue;
-                for(uintptr_t q = p+5; q < p+100 && q < re-5; q++) {
-                    uint8_t* s = (uint8_t*)q;
-                    if(s[0]==0xC3||s[0]==0xC2) break;
-                    if(s[0]==0xE8) {
-                        uintptr_t cand = q+5+(int32_t)(s[1]|(s[2]<<8)|(s[3]<<16)|(s[4]<<24));
-                        if(cand >= rs && cand < re && cand != g_fnLuaLoadBuf) {
-                            g_fnLuaPcall = cand;
-                            Log("[Lua] âœ“ lua_pcall xref DLL+0x%llX", (unsigned long long)(cand-base));
-                            break;
-                        }
-                    }
-                }
-                if(g_fnLuaPcall) break;
-            }
-        }
-        if(!g_fnLuaPcall) Log("[Lua] âœ— lua_pcall not found");
-    }
-    // ── lua_settop (for lua_State capture via VEH+HWBP) ─────────────────────
-    // Primary: find via xref from lua_fx_opendebug export.
-    // lua_fx_opendebug calls lua_settop(L, 0) near the end.
-    // Scan ALL CALL instructions in the export body; the last CALL before
-    // the function epilogue is very likely lua_settop(L, 0).
-    if(!g_fnLuaSettop) {
-        uintptr_t dllBase = (uintptr_t)g_hLuaDll;
-        uintptr_t dllEnd  = dllBase;
-        for(int ri = 0; ri < nExec; ri++) dllEnd = execRanges[ri].start + execRanges[ri].size;
-        static const char* s_settopExports[] = {
-            "?lua_fx_opendebug@fx@@YAHPEAUlua_State@@@Z",
-            "?lua_fx_openio@fx@@YAHPEAUlua_State@@@Z",
-            "?lua_fx_openos@fx@@YAHPEAUlua_State@@@Z",
-        };
-        for(int xi = 0; xi < 3 && !g_fnLuaSettop; xi++) {
-            uintptr_t fn = (uintptr_t)GetProcAddress(g_hLuaDll, s_settopExports[xi]);
-            if(!fn || IsBadReadPtr((void*)fn, 0x200)) continue;
-            Log("[Lua] settop xref: scanning %s @ DLL+0x%llX",
-                s_settopExports[xi], (unsigned long long)(fn - dllBase));
-            // Dump first 32 bytes for debugging
-            {
-                uint8_t* d = (uint8_t*)fn;
-                Log("[Lua]   bytes: %02X %02X %02X %02X %02X %02X %02X %02X  %02X %02X %02X %02X %02X %02X %02X %02X",
-                    d[0],d[1],d[2],d[3],d[4],d[5],d[6],d[7],d[8],d[9],d[10],d[11],d[12],d[13],d[14],d[15]);
-                Log("[Lua]          %02X %02X %02X %02X %02X %02X %02X %02X  %02X %02X %02X %02X %02X %02X %02X %02X",
-                    d[16],d[17],d[18],d[19],d[20],d[21],d[22],d[23],d[24],d[25],d[26],d[27],d[28],d[29],d[30],d[31]);
-            }
-            // Collect ALL E8 call targets within the export body (up to 512 bytes)
-            // Validate each: lua_settop checks idx (edx) with test/cmp in first 40 bytes
-            // lua_settop(L, idx) checks idx (edx) early.  LTO may use:
-            //   test edx,edx (85 D2)  |  cmp edx,imm8 (83 FA)
-            //   movsxd rXX,edx (63 xx where xx&0xC7==0xC2)  — sign-extend before test
-            auto ValidateSettopXref = [](uintptr_t fn) -> bool {
-                if(IsBadReadPtr((void*)fn, 80)) return false;
-                const uint8_t* b = (const uint8_t*)fn;
-                for(int i = 0; i < 60; i++) {
-                    if(i < 59 && b[i] == 0x85 && b[i+1] == 0xD2) return true; // test edx,edx
-                    if(i < 58 && b[i] == 0x83 && b[i+1] == 0xFA) return true; // cmp edx, imm8
-                    // movsxd rXX, edx — compiler sign-extends idx before branching
-                    if(i < 59 && b[i] == 0x63 && (b[i+1] & 0xC7) == 0xC2) return true;
-                    if(i > 0 && i < 59 && (b[i-1]&0xF0)==0x40 && b[i]==0x63 && (b[i+1]&0xC7)==0xC2) return true;
-                    // test esi,esi / test edi,edi after mov from edx
-                    if(i < 59 && b[i] == 0x85 && (b[i+1] == 0xF6 || b[i+1] == 0xFF)) return true;
-                }
-                return false;
-            };
-            int callCount = 0;
-            for(int off = 0; off < 512; off++) {
-                uint8_t* b = (uint8_t*)(fn + off);
-                if(IsBadReadPtr(b, 6)) break;
-                if(b[0] == 0xE8) {
-                    int32_t rel = (int32_t)(b[1]|(b[2]<<8)|(b[3]<<16)|(b[4]<<24));
-                    uintptr_t tgt = (uintptr_t)(b) + 5 + rel;
-                    if(tgt > dllBase && tgt < dllEnd) {
-                        bool valid = ValidateSettopXref(tgt);
-                        // Dump first 16 bytes of every target for diagnostics
-                        if(!IsBadReadPtr((void*)tgt, 16)) {
-                            const uint8_t* d = (const uint8_t*)tgt;
-                            Log("[Lua]   CALL at +0x%X -> DLL+0x%llX %s  [%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X]",
-                                off, (unsigned long long)(tgt - dllBase),
-                                valid ? "<-- settop" : "",
-                                d[0],d[1],d[2],d[3],d[4],d[5],d[6],d[7],
-                                d[8],d[9],d[10],d[11],d[12],d[13],d[14],d[15]);
-                        }
-                        callCount++;
-                        if(valid && !g_fnLuaSettop) {
-                            g_fnLuaSettop = tgt;
-                            Log("[Lua] lua_settop xref (validated): DLL+0x%llX",
-                                (unsigned long long)(tgt - dllBase));
-                        }
-                    }
-                    off += 4;
-                }
-            }
-            Log("[Lua]   scanned %d calls", callCount);
-        }
-        // Fallback: pattern scan with validation
-        if(!g_fnLuaSettop) {
-            struct SettopPat { const uint8_t* b; const char* m; int n; };
-            const uint8_t psA[] = {0x48,0x89,0x5C,0x24,0,0x48,0x89,0x6C,0x24,0,0x57,0x48,0x83,0xEC,0,0x48,0x8B,0xE9};
-            const uint8_t psB[] = {0x48,0x89,0x5C,0x24,0,0x48,0x89,0x74,0x24,0,0x57,0x48,0x83,0xEC,0};
-            const SettopPat stPats[] = {
-                {psB, "xxxx?xxxx?xxxx?", 15},
-                {psA, "xxxx?xxxx?xxxx?xxx", 18},
-            };
-            auto ValidateSettop = [](uintptr_t fn) -> bool {
-                if(IsBadReadPtr((void*)fn, 60)) return false;
-                const uint8_t* b = (const uint8_t*)fn;
-                for(int i = 0; i < 40; i++) {
-                    if(i < 39 && b[i] == 0x85 && b[i+1] == 0xD2) return true;
-                    if(i < 38 && b[i] == 0x83 && b[i+1] == 0xFA && b[i+2] == 0x00) return true;
-                }
-                return false;
-            };
-            for(const auto& sp : stPats) {
-                for(int ri = 0; ri < nExec && !g_fnLuaSettop; ri++) {
-                    uintptr_t rs = execRanges[ri].start, re = rs + execRanges[ri].size;
-                    for(uintptr_t p = rs; p < re - (uintptr_t)sp.n; p++) {
-                        bool ok = true;
-                        for(int j = 0; j < sp.n; j++) if(sp.m[j]=='x' && ((uint8_t*)p)[j]!=sp.b[j]){ok=false;break;}
-                        if(!ok) continue;
-                        uintptr_t off = p - (uintptr_t)g_hLuaDll;
-                        if(ValidateSettop(p)) {
-                            g_fnLuaSettop = p;
-                            Log("[Lua] lua_settop DLL+0x%llX (pat, validated)", (unsigned long long)off);
-                            break;
-                        }
-                    }
-                }
-                if(g_fnLuaSettop) break;
-            }
-        }
-        if(!g_fnLuaSettop) Log("[Lua] lua_settop not found");
-    }
-    // ── lua_load internal (LTO-surviving replacement for luaL_loadbufferx) ──
-    if(!g_fnLuaLoad) {
-        // 48 89 5C 24 ? 48 89 74 24 ? 48 89 7C 24 ? 55 41 56 41 57 48 8D 6C 24 ? 48 81 EC
-        const uint8_t pl[] = {0x48,0x89,0x5C,0x24,0,0x48,0x89,0x74,0x24,0,0x48,0x89,0x7C,0x24,0,
-                              0x55,0x41,0x56,0x41,0x57,0x48,0x8D,0x6C,0x24,0,0x48,0x81,0xEC};
-        const char*   plm  = "xxxx?xxxx?xxxx?xxxxxxxxxx?xxx";
-        const int     plen = 28;
-        for(int ri = 0; ri < nExec && !g_fnLuaLoad; ri++) {
-            uintptr_t rs = execRanges[ri].start, re = rs + execRanges[ri].size;
-            for(uintptr_t p = rs; p < re - plen; p++) {
-                bool ok = true;
-                for(int j = 0; j < plen; j++) if(plm[j]=='x' && ((uint8_t*)p)[j]!=pl[j]){ok=false;break;}
-                if(ok){ g_fnLuaLoad = p; Log("[Lua] lua_load(internal) DLL+0x%llX",(unsigned long long)(p-(uintptr_t)g_hLuaDll)); break; }
-            }
-        }
-        if(!g_fnLuaLoad) Log("[Lua] lua_load(internal) not found");
-    }
-    // ── fallback: use exported lua_fx_open* directly as HWBP target ──
-    // If xref scan didn't find settop, put HWBP on the export itself.
-    // The export takes lua_State* as RCX, so VEH captures it on hit.
-    if(!g_fnLuaSettop) {
-        static const char* s_stateExports[] = {
-            "?lua_fx_opendebug@fx@@YAHPEAUlua_State@@@Z",
-            "?lua_fx_openio@fx@@YAHPEAUlua_State@@@Z",
-            "?lua_fx_openos@fx@@YAHPEAUlua_State@@@Z",
-        };
-        for(int xi = 0; xi < 3 && !g_fnLuaSettop; xi++) {
-            uintptr_t fn = (uintptr_t)GetProcAddress(g_hLuaDll, s_stateExports[xi]);
-            if(fn) {
-                g_fnLuaSettop = fn;
-                Log("[Lua] HWBP target (export fallback): DLL+0x%llX (%s)",
-                    (unsigned long long)(fn - (uintptr_t)g_hLuaDll), s_stateExports[xi]);
-            }
-        }
-        if(!g_fnLuaSettop) Log("[Lua] No state-capture HWBP target found");
-    }
-    // ── pcall discovery: scan bodies of lua_fx_open* for CALL xrefs ──────────
-    // lua_fx_openX calls luaL_requiref which calls lua_pcall(L,1,1,0). We scan
-    // up to 512 bytes of each open-function body, collecting all CALL targets.
-    // For each target, check if its first 20 bytes match a near-ret (tiny func)
-    // or if a deeper scan finds a pattern near xor-r9d (4th arg = 0 = errfunc).
-    if(!g_fnLuaPcall) {
-        static const char* s_pcallExports[] = {
-            "?lua_fx_opendebug@fx@@YAHPEAUlua_State@@@Z",
-            "?lua_fx_openio@fx@@YAHPEAUlua_State@@@Z",
-            "?lua_fx_openos@fx@@YAHPEAUlua_State@@@Z",
-        };
-        uintptr_t dllBase = (uintptr_t)g_hLuaDll;
-        uintptr_t dllEnd  = dllBase;
-        // approximate DLL text end from first exec range
-        for(int ri = 0; ri < nExec; ri++) dllEnd = execRanges[ri].start + execRanges[ri].size;
-        for(int xi = 0; xi < 3 && !g_fnLuaPcall; xi++) {
-            uintptr_t fn = (uintptr_t)GetProcAddress(g_hLuaDll, s_pcallExports[xi]);
-            if(!fn || IsBadReadPtr((void*)fn, 0x200)) continue;
-            // Scan body of this export for CALL instructions
-            for(int off = 0; off < 512 && !g_fnLuaPcall; off++) {
-                uint8_t* b = (uint8_t*)(fn + off);
-                if(IsBadReadPtr(b, 6)) break;
-                if(b[0] == 0xC3 || b[0] == 0xC2) break; // ret
-                if(b[0] != 0xE8) continue;
-                uintptr_t tgt = (fn + off) + 5 + (int32_t)(b[1]|(b[2]<<8)|(b[3]<<16)|(b[4]<<24));
-                if(tgt < dllBase || tgt >= dllEnd) continue;
-                // Scan tgt's body for a call that is preceded by xor r9d,r9d (errfunc=0)
-                // xor r9d,r9d = 45 33 C9
-                for(int off2 = 0; off2 < 256 && !g_fnLuaPcall; off2++) {
-                    uint8_t* s2 = (uint8_t*)(tgt + off2);
-                    if(IsBadReadPtr(s2, 6)) break;
-                    if(s2[0] == 0xC3 || s2[0] == 0xC2) break;
-                    // xor r9d,r9d (45 33 C9) within 6 bytes before a CALL
-                    if(s2[0] == 0x45 && s2[1] == 0x33 && s2[2] == 0xC9) {
-                        // look for CALL within next 10 bytes
-                        for(int ck = 1; ck < 10; ck++) {
-                            uint8_t* sc = s2 + ck;
-                            if(IsBadReadPtr(sc, 6)) break;
-                            if(sc[0] == 0xE8) {
-                                uintptr_t cand = (uintptr_t)(sc) + 5 + (int32_t)(sc[1]|(sc[2]<<8)|(sc[3]<<16)|(sc[4]<<24));
-                                if(cand > dllBase && cand < dllEnd) {
-                                    g_fnLuaPcall = cand;
-                                    Log("[Lua] lua_pcall xref via export body: DLL+0x%llX",
-                                        (unsigned long long)(cand - dllBase));
-                                }
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        if(!g_fnLuaPcall) Log("[Lua] lua_pcall not found via export xref");
-    }
-
-    // ── Record scripting-lua loadbufferx for HWBP (state capture + injection) ──
-    // Only set once — never overwrite with metadata-lua's address on re-scan
-    static bool s_bpLoadBufSet = false;
-    if(!s_bpLoadBufSet) {
-        s_bpLoadBufSet = true;
-        g_fnLuaBpLoadBuf = g_fnLuaLoadBuf; // 0 if scripting-lua didn't yield it
-    }
-
-    // ── citizen-resources-metadata-lua.dll fallback ──────────────────────────
-    // This DLL embeds its own Lua 5.4 build for parsing fxmanifest.lua.
-    // Its Lua functions share the same ABI, so we can call them with a
-    // scripting-lua lua_State. Only used for CALLING, never for HWBP.
-    if(!g_fnLuaLoadBuf || !g_fnLuaPcall) {
-        HMODULE hMeta = GetModuleHandleA("citizen-resources-metadata-lua.dll");
-        if(hMeta && hMeta != g_hLuaDll) {
-            uintptr_t mBase = (uintptr_t)hMeta;
-            Log("[Lua] Fallback: scanning citizen-resources-metadata-lua.dll @ %p", hMeta);
-
-            // Parse PE exec sections
-            ScanRange mRanges[8]; int nMR = 0;
-            {
-                auto* mdos = (IMAGE_DOS_HEADER*)mBase;
-                if(mdos->e_magic == IMAGE_DOS_SIGNATURE && !IsBadReadPtr((void*)(mBase+mdos->e_lfanew), sizeof(IMAGE_NT_HEADERS64))) {
-                    auto* mnt = (IMAGE_NT_HEADERS*)(mBase + mdos->e_lfanew);
-                    auto* msec = IMAGE_FIRST_SECTION(mnt);
-                    for(int s = 0; s < mnt->FileHeader.NumberOfSections && nMR < 8; s++) {
-                        if(!(msec[s].Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
-                        uintptr_t sb = mBase + msec[s].VirtualAddress;
-                        uint32_t  sz = msec[s].Misc.VirtualSize;
-                        if(sz < 64 || IsBadReadPtr((void*)sb, 8)) continue;
-                        mRanges[nMR++] = {sb, sz};
-                    }
-                }
-            }
-            if(nMR == 0) {
-                MODULEINFO mi2{};
-                GetModuleInformation(GetCurrentProcess(), hMeta, &mi2, sizeof(mi2));
-                mRanges[nMR++] = {mBase, mi2.SizeOfImage};
-            }
-
-            // Always find loadbufferx inside metadata-lua so the pcall xref scan
-            // can look for its callers within the same DLL. Store in a local var
-            // so we don't clobber g_fnLuaLoadBuf if scripting-lua already set it.
-            uintptr_t metaLoadBuf = 0;
-            {
-                const uint8_t mp1[]={0x4C,0x8B,0xDC,0x53,0x48,0x83,0xEC,0x60};
-                const uint8_t mp2[]={0x4C,0x8B,0xD4,0x53,0x48,0x83,0xEC,0x60};
-                const uint8_t mp3[]={0x53,0x48,0x83,0xEC,0x40,0x4C,0x8B,0xDA};
-                const uint8_t mp4[]={0x48,0x89,0x4C,0x24,0x08,0x48,0x89,0x54,0x24,0x10,0x53};
-                const uint8_t mp5[]={0x48,0x83,0xEC,0x58,0x48,0x89,0x5C,0x24};
-                const uint8_t mp6[]={0x4C,0x8B,0xDC,0x57,0x48,0x83,0xEC,0x50};
-                const uint8_t mp7[]={0x4C,0x8B,0xDC,0x49,0x89,0x5B,0x08};
-                const uint8_t mp8[]={0x40,0x53,0x48,0x83,0xEC,0x50,0x33,0xC0};
-                const uint8_t mp9[]={0x48,0x8B,0xC4,0x48,0x89,0x58,0x08,0x48,0x89,0x68,0x10};
-                struct MPI { const uint8_t* b; int n; };
-                const MPI mpats[] = {{mp1,8},{mp2,8},{mp3,8},{mp4,11},{mp5,8},{mp6,8},{mp7,7},{mp8,8},{mp9,11}};
-                for(const auto& pi : mpats) {
-                    for(int ri = 0; ri < nMR && !metaLoadBuf; ri++) {
-                        uintptr_t rs = mRanges[ri].start, re = rs + mRanges[ri].size;
-                        for(uintptr_t p = rs; p < re - (uintptr_t)pi.n; p++) {
-                            if(!memcmp((void*)p, pi.b, pi.n)){
-                                metaLoadBuf = p;
-                                Log("[Lua] loadbufferx in metadata-lua DLL+0x%llX (pattern)", (unsigned long long)(p-mBase));
-                                break;
-                            }
-                        }
-                    }
-                    if(metaLoadBuf) break;
-                }
-                // Export fallback
-                if(!metaLoadBuf) metaLoadBuf = (uintptr_t)GetProcAddress(hMeta, "luaL_loadbufferx");
-                if(!metaLoadBuf) metaLoadBuf = (uintptr_t)GetProcAddress(hMeta, "luaL_loadbuffer");
-                if(metaLoadBuf) Log("[Lua] loadbufferx via metadata-lua export");
-                // getS indirect scan in metadata-lua
-                if(!metaLoadBuf) {
-                    const uint8_t gs[]={0x48,0x8B,0x42,0x08,0x48,0x85,0xC0,0x74};
-                    for(int ri = 0; ri < nMR && !metaLoadBuf; ri++) {
-                        uintptr_t rs = mRanges[ri].start, re = rs + mRanges[ri].size;
-                        for(uintptr_t p = rs; p < re - 8; p++) {
-                            if(memcmp((void*)p, gs, 8)) continue;
-                            uintptr_t funcStart = 0;
-                            for(int back = 1; back < 0x400; back++) {
-                                if(IsBadReadPtr((void*)(p - back), 1)) break;
-                                uint8_t c = *(uint8_t*)(p - back);
-                                if(c == 0xC3 || c == 0xCC || c == 0xC2) { funcStart = p - back + 1; break; }
-                            }
-                            if(funcStart && !IsBadReadPtr((void*)funcStart, 16)) {
-                                metaLoadBuf = funcStart;
-                                Log("[Lua] loadbufferx (getS trace) metadata-lua DLL+0x%llX", (unsigned long long)(funcStart-mBase));
-                            }
-                            break;
-                        }
-                    }
-                }
-                // Use metaLoadBuf as g_fnLuaLoadBuf only if scripting-lua didn't provide one
-                if(!g_fnLuaLoadBuf && metaLoadBuf) {
-                    g_fnLuaLoadBuf = metaLoadBuf;
-                    Log("[Lua] g_fnLuaLoadBuf set from metadata-lua");
-                }
-            }
-
-            // pcall scan in metadata-lua
-            if(!g_fnLuaPcall) {
-                g_fnLuaPcall = (uintptr_t)GetProcAddress(hMeta, "lua_pcall");
-                if(!g_fnLuaPcall) g_fnLuaPcall = (uintptr_t)GetProcAddress(hMeta, "lua_pcallk");
-                if(g_fnLuaPcall) Log("[Lua] pcall via metadata-lua export");
-            }
-            // pcall xref from loadbufferx callers *within metadata-lua*.
-            // Use metaLoadBuf (always a metadata-lua address) so the scan finds
-            // callers inside the same DLL, regardless of where g_fnLuaLoadBuf came from.
-            if(!g_fnLuaPcall && metaLoadBuf) {
-                for(int ri = 0; ri < nMR && !g_fnLuaPcall; ri++) {
-                    uintptr_t rs = mRanges[ri].start, re = rs + mRanges[ri].size;
-                    for(uintptr_t p = rs; p < re - 5; p++) {
-                        uint8_t* b = (uint8_t*)p;
-                        if(b[0] != 0xE8) continue;
-                        uintptr_t tgt = p + 5 + (int32_t)(b[1]|(b[2]<<8)|(b[3]<<16)|(b[4]<<24));
-                        if(tgt != metaLoadBuf) continue;
-                        for(uintptr_t q = p+5; q < p+100 && q < re-5; q++) {
-                            uint8_t* s = (uint8_t*)q;
-                            if(s[0]==0xC3||s[0]==0xC2) break;
-                            if(s[0]==0xE8) {
-                                uintptr_t cand = q+5+(int32_t)(s[1]|(s[2]<<8)|(s[3]<<16)|(s[4]<<24));
-                                if(cand >= rs && cand < re && cand != metaLoadBuf) {
-                                    g_fnLuaPcall = cand;
-                                    Log("[Lua] pcall xref in metadata-lua DLL+0x%llX", (unsigned long long)(cand-mBase));
-                                    break;
-                                }
-                            }
-                        }
-                        if(g_fnLuaPcall) break;
-                    }
-                }
-            }
-            // xor r9d,r9d pcall scan in metadata-lua (same as scripting-lua export body scan)
-            if(!g_fnLuaPcall) {
-                uintptr_t fn = (uintptr_t)GetProcAddress(hMeta, "CreateComponent");
-                if(fn && !IsBadReadPtr((void*)fn, 0x200)) {
-                    uintptr_t mEnd = mRanges[0].start + mRanges[0].size;
-                    for(int off = 0; off < 512 && !g_fnLuaPcall; off++) {
-                        uint8_t* b = (uint8_t*)(fn + off);
-                        if(IsBadReadPtr(b, 6)) break;
-                        if(b[0] == 0xC3 || b[0] == 0xC2) break;
-                        if(b[0] != 0xE8) continue;
-                        uintptr_t tgt = (fn + off) + 5 + (int32_t)(b[1]|(b[2]<<8)|(b[3]<<16)|(b[4]<<24));
-                        if(tgt < mBase || tgt >= mEnd) continue;
-                        for(int off2 = 0; off2 < 256 && !g_fnLuaPcall; off2++) {
-                            uint8_t* s2 = (uint8_t*)(tgt + off2);
-                            if(IsBadReadPtr(s2, 6)) break;
-                            if(s2[0] == 0xC3 || s2[0] == 0xC2) break;
-                            if(s2[0] == 0x45 && s2[1] == 0x33 && s2[2] == 0xC9) {
-                                for(int ck = 1; ck < 10; ck++) {
-                                    uint8_t* sc = s2 + ck;
-                                    if(IsBadReadPtr(sc, 6)) break;
-                                    if(sc[0] == 0xE8) {
-                                        uintptr_t cand = (uintptr_t)(sc) + 5 + (int32_t)(sc[1]|(sc[2]<<8)|(sc[3]<<16)|(sc[4]<<24));
-                                        if(cand > mBase && cand < mEnd) {
-                                            g_fnLuaPcall = cand;
-                                            Log("[Lua] pcall xref via metadata-lua CreateComponent: DLL+0x%llX",
-                                                (unsigned long long)(cand - mBase));
-                                        }
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // If pcall is from metadata-lua it won't fire during normal gameplay,
-            // so use settop as the exec trigger instead.
-            if(g_fnLuaPcall >= mBase && g_fnLuaPcall < mBase + 0x800000 /*~max DLL size*/) {
-                g_usingMetadataLua = true;
-                Log("[Lua] pcall from metadata-lua -- settop will be exec trigger");
-            }
-        }
-    }
-
-    // Get lua_rpmalloc_state export to obtain Lua state directly
-    if(!g_fnLuaRpmallocState && g_hLuaDll) {
-        g_fnLuaRpmallocState = (uintptr_t)GetProcAddress(g_hLuaDll, "?lua_rpmalloc_state@LuaStateHolder@fx@@CAPEAUlua_State@@AEAPEAX@Z");
-        if(g_fnLuaRpmallocState) {
-            Log("[Lua] lua_rpmalloc_state found at DLL+0x%llX",
-                (unsigned long long)(g_fnLuaRpmallocState - (uintptr_t)g_hLuaDll));
-        }
-    }
+    Log("[Lua] ✓ Hardcoded b3258 addresses:");
+    Log("[Lua]   lua_load   = 0x%llX", (unsigned long long)g_fnLuaLoad);
+    Log("[Lua]   luaD_pcall = 0x%llX", (unsigned long long)g_fnLuaPcall);
+    Log("[Lua]   lua_settop = 0x%llX", (unsigned long long)g_fnLuaSettop);
 }
-
 static int __fastcall HkLuaLoadBufX(void* L, const char* buf, size_t sz,
                                       const char* name, const char* mode){
     if(!g_luaState) {
@@ -1179,44 +587,34 @@ static void FLog(const char* fmt, ...) {
     fprintf(f, "\n"); fflush(f); fclose(f);
 }
 
-// DoLuaDeferred / InitTrampoline — implementations (forward-declared above)
-static void DoLuaDeferred() {
-    // g_trampL is set by the trampoline path; when called directly via APC it's 0
-    void* L = g_trampL ? (void*)g_trampL : g_luaState;
-    FLog("DoLuaDeferred: L=%p (trampL=%p luaState=%p) sz=%zu", L, (void*)g_trampL, g_luaState, g_luaExecSz);
-    if(!L || !g_luaExecBuf || !g_luaExecSz
-       || !g_fnLuaLoadBuf || !g_fnLuaPcall) {
-        FLog("DoLuaDeferred: SKIP (L=%p buf=%p sz=%zu lbx=%llX pc=%llX)",
-             L, g_luaExecBuf, g_luaExecSz,
-             (unsigned long long)g_fnLuaLoadBuf, (unsigned long long)g_fnLuaPcall);
-        return;
-    }
-    int loadRet = ((LuaLBX_t)g_fnLuaLoadBuf)(L, g_luaExecBuf, g_luaExecSz, "qwak", nullptr);
-    FLog("loadbufferx=%d", loadRet);
-    Log("[Lua] loadbufferx=%d", loadRet);
-    if(loadRet == 0) {
-        // lua_pcallk: L, nargs, nresults, errfunc, ctx, k  (6 params)
-        using Pcallk_t = int(__fastcall*)(void*,int,int,int,intptr_t,void*);
-        int pcRet = ((Pcallk_t)g_fnLuaPcall)(L, 0, 0, 0, 0, nullptr);
-        FLog("pcall=%d", pcRet);
-        Log("[Lua] pcall=%d", pcRet);
-        if(pcRet != 0 && g_fnLuaSettop) {
-            // Pop error message to keep Lua stack clean
-            using Settop_t = void(__fastcall*)(void*, int);
-            ((Settop_t)g_fnLuaSettop)(L, -2);
-        }
-    } else {
-        // Pop error from failed load
-        if(g_fnLuaSettop) {
-            using Settop_t = void(__fastcall*)(void*, int);
-            ((Settop_t)g_fnLuaSettop)(L, -2);
-        }
-        FLog("loadbufferx FAILED (%d)", loadRet);
-        Log("[Lua] load FAILED (%d)", loadRet);
-    }
-    FLog("DoLuaDeferred DONE");
+static int ProtectedLuaLoad(void* L, void* ud) {
+    LuaLoadS* s = (LuaLoadS*)ud;
+    return ((LuaLoad_t)g_fnLuaLoad)(L, LuaGetS, s, "qwak", nullptr);
 }
 
+static void DoLuaDeferred() {
+    if (!g_luaExecPending || !g_trampL || !g_luaInjBuf) return;
+
+    void* L = (void*)g_trampL;
+
+    Log("[Lua] DoLuaDeferred: Running code directly on Lua thread (L=%p)", L);
+
+    struct LuaLoadS s = { g_luaInjBuf, g_luaInjSz };
+
+    void* funcPtr = (void*)ProtectedLuaLoad;
+    int status = ((LuaDPCall_t)g_fnLuaPcall)(L, funcPtr, &s, 0LL, nullptr);
+
+    if (status == 0) {
+        Log("[Lua] ✓ INSTANT SUCCESS — vehicle should spawn RIGHT NOW");
+    } else {
+        Log("[Lua] luaD_pcall failed (%d)", status);
+    }
+
+    g_luaExecPending = false;
+    free(g_luaInjBuf);
+    g_luaInjBuf = nullptr;
+    g_luaInjSz = 0;
+}
 static void InitTrampoline() {
     if(g_trampCode) return;
     g_trampCode = (uint8_t*)VirtualAlloc(nullptr, 64, MEM_COMMIT|MEM_RESERVE, PAGE_EXECUTE_READWRITE);
@@ -1266,25 +664,14 @@ static LONG CALLBACK LuaVehHandler(PEXCEPTION_POINTERS pEx) {
         }
 
         // Hit on luaL_loadbufferx: swap buf/sz registers to inject our code
-        if(g_fnLuaBpLoadBuf && addr == g_fnLuaBpLoadBuf) {
+        if (g_fnLuaBpLoadBuf && addr == g_fnLuaBpLoadBuf) {
             pEx->ContextRecord->Dr0 = 0;
             pEx->ContextRecord->Dr7 &= ~1ULL;
 
-            // Capture lua_State from RCX
-            void* L = (void*)pEx->ContextRecord->Rcx;
-            if(!g_luaState && L) {
-                g_luaState = L;
-            }
-
-            // Replace the entire buffer with our pre-built injection code.
-            // NO malloc/free here — VEH handlers must not use heap functions.
-            // The original script is skipped this one call; it reloads next time.
-            if(g_luaInjBuf && g_luaInjSz > 0) {
-                pEx->ContextRecord->Rdx = (DWORD64)g_luaInjBuf;
-                pEx->ContextRecord->R8  = (DWORD64)g_luaInjSz;
-                g_luaHooked = false;
-                // Don't free g_luaInjBuf here — it's used by the function we're returning to.
-                // It will be freed on the next ExecLua call.
+            if (g_luaInjBuf && g_luaInjSz > 0) {
+                pEx->ContextRecord->Rdx = (DWORD64)g_luaInjBuf;   // buffer pointer
+                pEx->ContextRecord->R8  = (DWORD64)g_luaInjSz;    // size
+                Log("[Lua] ✓ BUFFER REPLACED SUCCESSFULLY (%zu bytes) — spawn code injected!", g_luaInjSz);
             }
             return EXCEPTION_CONTINUE_EXECUTION;
         }
@@ -1309,59 +696,40 @@ static LONG CALLBACK LuaVehHandler(PEXCEPTION_POINTERS pEx) {
             return EXCEPTION_CONTINUE_EXECUTION;
         }
 
-        // Hit on lua_settop: capture state, and run deferred exec via trampoline when pending
-        if(g_fnLuaSettop && addr == g_fnLuaSettop) {
-            static int s_stHits = 0;
-            s_stHits++;
-            if(s_stHits <= 5) {
-                FLog("settop hit #%d L=%p", s_stHits, (void*)pEx->ContextRecord->Rcx);
-                Log("[Lua] settop BP hit #%d L=%p", s_stHits, (void*)pEx->ContextRecord->Rcx);
-            }
-
+                // Hit on lua_settop: capture state, and run deferred exec via trampoline when pending
+                // ── SETTOP HIT ─────────────────────────────────────────────────────
+                // Hit on lua_settop: capture + direct execution (no trampoline)
+        if (g_fnLuaSettop && addr == g_fnLuaSettop) {
             void* L = (void*)pEx->ContextRecord->Rcx;
-            if(L && !g_luaState) {
-                g_luaState = L;
-                Log("[Lua] State captured: %p", L);
-                // Capture scripting thread handle for QueueUserAPC
-                if(!g_luaThread) {
-                    g_luaThread = OpenThread(THREAD_SET_CONTEXT, FALSE, GetCurrentThreadId());
-                    FLog("Scripting thread: %lu handle=%p", GetCurrentThreadId(), g_luaThread);
-                    Log("[Lua] Scripting thread handle captured (tid=%lu)", GetCurrentThreadId());
+            FLog("settop hit | L=%p | pending=%d", L, (int)g_luaExecPending);
+
+            if (g_luaExecPending && g_luaInjBuf) {
+                g_luaExecPending = false;
+
+                struct LuaLoadS s = { g_luaInjBuf, g_luaInjSz };
+
+                // Direct lua_load + lua_pcall - most reliable on b3258
+                int loadStatus = ((LuaLoad_t)g_fnLuaLoad)(L, LuaGetS, &s, "qwak_spawn", nullptr);
+
+                if (loadStatus == 0) {
+                    int pcallStatus = ((LuaPcall_t)g_fnLuaPcall)(L, 0, 0, 0);
+                    if (pcallStatus == 0) {
+                        Log("[Lua] ✓ INSTANT SUCCESS - Vehicle spawn code executed!");
+                    } else {
+                        Log("[Lua] lua_pcall failed (status %d)", pcallStatus);
+                    }
+                } else {
+                    Log("[Lua] lua_load failed (status %d)", loadStatus);
                 }
+
+                free(g_luaInjBuf);
+                g_luaInjBuf = nullptr;
+                g_luaInjSz = 0;
             }
 
-            if(g_luaExecPending && g_trampCode && L) {
-                // Only hijack when the state matches what we captured -- calling scripting-lua's
-                // loadbufferx with a state from a different Lua VM returns garbage.
-                if(L == g_luaState) {
-                    pEx->ContextRecord->Dr0 = 0;
-                    pEx->ContextRecord->Dr7 &= ~1ULL;
-                    g_luaExecPending = false;
-                    g_trampL = L;
-                    uintptr_t* rsp = (uintptr_t*)pEx->ContextRecord->Rsp;
-                    g_trampOrigRet = *rsp;
-                    *rsp = (uintptr_t)g_trampCode;
-                    FLog("settop trampoline: origRet=%llX L=%p",
-                        (unsigned long long)g_trampOrigRet, L);
-                    Log("[Lua] settop hijacked -> trampoline (L=%p)", L);
-                } else {
-                    // Wrong Lua VM -- single-step to re-arm BP and wait for the right state
-                    FLog("settop skip: L=%p != captured=%p, rearm", L, g_luaState);
-                    pEx->ContextRecord->Dr0 = 0;
-                    pEx->ContextRecord->Dr7 &= ~1ULL;
-                    pEx->ContextRecord->EFlags |= 0x100;
-                    g_settopRearmStep = true;
-                }
-            } else {
-                // No pending exec: disarm (state already captured or not needed)
-                pEx->ContextRecord->Dr0 = 0;
-                pEx->ContextRecord->Dr7 &= ~1ULL;
-                if(!g_luaState) {
-                    // State not yet captured: single-step to re-arm for next hit
-                    pEx->ContextRecord->EFlags |= 0x100;
-                    g_settopRearmStep = true;
-                }
-            }
+            // Disable BP after one use
+            pEx->ContextRecord->Dr0 = 0;
+            pEx->ContextRecord->Dr7 &= ~1ULL;
             return EXCEPTION_CONTINUE_EXECUTION;
         }
 
@@ -1400,6 +768,7 @@ static LONG CALLBACK LuaVehHandler(PEXCEPTION_POINTERS pEx) {
 static void LuaEarlyInit() {
     if(g_luaEarlyDone) return;
     g_luaEarlyDone = true;
+    InitTrampoline();
     ScanLuaFunctions();
     if(!g_vehHandle) {
         g_vehHandle = AddVectoredExceptionHandler(1, LuaVehHandler);
@@ -1416,72 +785,35 @@ static void LuaEarlyInit() {
     }
 }
 
-static void ExecLua(const char* code){
-    if(!code || !code[0]) { Log("[Lua] ERROR: empty code"); return; }
+static void ExecLua(const char* code) {
+    if (!code || !code[0]) return;
+
     Log("\n[Lua] ====== ExecLua %zu bytes ======", strlen(code));
-    FLog("ExecLua called, %zu bytes", strlen(code));
 
     ScanLuaFunctions();
 
-    if(!g_fnLuaLoadBuf) { Log("[Lua] No loadbufferx found"); FLog("ABORT: no loadbufferx"); return; }
-    if(!g_fnLuaPcall)   { Log("[Lua] No pcall found"); FLog("ABORT: no pcall"); return; }
-    if(!g_fnLuaSettop)  { Log("[Lua] Warning: no settop -- error cleanup disabled"); }
-
-    // Try to get Lua state from rpmalloc_state if not cached
-    if(!g_luaState && g_fnLuaRpmallocState) {
-        void* L = ((LuaRpmallocState_t)g_fnLuaRpmallocState)();
-        if(L) {
-            g_luaState = L;
-            Log("[Lua] Pre-captured state via rpmalloc_state: %p", L);
-            FLog("Pre-captured state: %p", L);
-        }
+    if (!g_fnLuaLoad) {
+        Log("[Lua] No lua_load found");
+        return;
     }
 
-    // Ensure VEH is installed
-    if(!g_vehHandle) {
-        g_vehHandle = AddVectoredExceptionHandler(1, LuaVehHandler);
-        Log("[Lua] VEH handler installed");
-        FLog("VEH installed");
-    }
-    if(!g_vehHandle) { Log("[Lua] VEH install FAILED"); FLog("ABORT: VEH failed"); return; }
+    g_fnLuaBpLoadBuf = g_fnLuaLoad;
 
-    InitTrampoline();
-    if(!g_trampCode) { Log("[Lua] Trampoline alloc FAILED"); FLog("ABORT: trampoline failed"); return; }
-
-    // Build code buffer
+    // Clean wrapper
     std::string buf = "local _ok,_er=pcall(function()\n";
     buf += code;
-    buf += "\nend) if not _ok then print('[QWAK] '..tostring(_er)) end\n";
+    buf += "\nend) if not _ok then print('[QWAK]'..tostring(_er)) end\n";
 
-    // Queue for deferred execution
-    if(g_luaExecBuf) { free(g_luaExecBuf); g_luaExecBuf = nullptr; }
-    g_luaExecBuf = (char*)malloc(buf.size() + 1);
-    if(!g_luaExecBuf) { Log("[Lua] malloc FAILED"); FLog("ABORT: malloc failed"); return; }
-    memcpy(g_luaExecBuf, buf.c_str(), buf.size() + 1);
-    g_luaExecSz = buf.size();
-
-    Log("[Lua] Queued %zu bytes (state=%p)", buf.size(), g_luaState);
-    FLog("Queued %zu bytes, state=%p", buf.size(), g_luaState);
+    if (g_luaInjBuf) free(g_luaInjBuf);
+    g_luaInjBuf = (char*)malloc(buf.size() + 1);
+    if (!g_luaInjBuf) return;
+    memcpy(g_luaInjBuf, buf.c_str(), buf.size() + 1);
+    g_luaInjSz = buf.size();
 
     g_luaExecPending = true;
 
-    // Primary: QueueUserAPC on the scripting thread (fires at next alertable wait)
-    if(g_luaThread) {
-        DWORD result = QueueUserAPC([](ULONG_PTR) { DoLuaDeferred(); }, g_luaThread, 0);
-        if(result) {
-            Log("[Lua] QueueUserAPC dispatched to scripting thread");
-            FLog("QueueUserAPC OK");
-            g_luaExecPending = false;
-            return;
-        }
-        Log("[Lua] QueueUserAPC failed (%lu), falling back to BP", GetLastError());
-        FLog("QueueUserAPC FAILED: %lu", GetLastError());
-    }
-
-    // Fallback: BP hijack — fires on next natural Lua call from scripting thread
-    if(!g_fnLuaSettop) { Log("[Lua] No settop for BP fallback"); FLog("ABORT: no settop"); g_luaExecPending = false; return; }
-    SetHardwareBP(g_fnLuaSettop);
-    Log("[Lua] BP armed on settop (APC unavailable, waiting for natural call)");
+    SetHardwareBP(g_fnLuaBpLoadBuf);
+    Log("[Lua] BP armed on lua_load — ready for instant injection");
 }
 static bool g_gameReady     = false;
 
@@ -2822,6 +2154,30 @@ static uintptr_t AobScan(const char* pattern, const char* mask) {
     return 0;
 }
 
+// Scans ONLY inside citizen-scripting-lua.dll (where the real Lua functions live)
+static uintptr_t LuaAobScan(const char* pattern, const char* mask) {
+    if (!g_hLuaDll) return 0;
+    uintptr_t base = (uintptr_t)g_hLuaDll;
+
+    MODULEINFO mi{};
+    if (!GetModuleInformation(GetCurrentProcess(), g_hLuaDll, &mi, sizeof(mi))) return 0;
+
+    uintptr_t end = base + mi.SizeOfImage;
+    size_t patLen = strlen(mask);
+
+    for (uintptr_t addr = base; addr < end - patLen; ++addr) {
+        bool found = true;
+        for (size_t i = 0; i < patLen; ++i) {
+            if (mask[i] == 'x' && ((uint8_t*)addr)[i] != (uint8_t)pattern[i]) {
+                found = false;
+                break;
+            }
+        }
+        if (found) return addr;
+    }
+    return 0;
+}
+
 static void ScanFunctions() {
     // HandleBullet: use per-build offset if known, fall back to AOB
     if(!g_fnHandleBullet && g_base && g_current_offsets && g_current_offsets->HandleBullet) {
@@ -3100,8 +2456,30 @@ static void ApplyFeatures() {
             Log("[Spawn] ERROR: Invalid ped position, cannot spawn");
         } else {
         Log("[Spawn] Model: %s | Position: (%.1f, %.1f, %.1f)", g_spawnModel, sp.x+5.f, sp.y, sp.z+1.f);
-        // TEST: just print to F8 console to confirm Lua fires before doing anything
-        const char* lua = "print('[QWAK] Lua test fired OK')";
+        char lua[512];
+        snprintf(lua, sizeof(lua),
+            "local modelName='%s'\n"
+            "print('[QWAK] Starting spawn for '..modelName)\n"
+            "local h=GetHashKey(modelName)\n"
+            "print('[QWAK] Hash: '..h)\n"
+            "RequestModel(h)\n"
+            "local attempts=0\n"
+            "while not HasModelLoaded(h) and attempts<50 do\n"
+            "  Wait(10)\n"
+            "  attempts=attempts+1\n"
+            "end\n"
+            "if HasModelLoaded(h) then\n"
+            "  local veh=CreateVehicle(h,%.1f,%.1f,%.1f,0.0,true,false)\n"
+            "  if veh and veh~=0 then\n"
+            "    print('[QWAK] Vehicle spawned: '..modelName..' id:'..veh)\n"
+            "  else\n"
+            "    print('[QWAK] CreateVehicle failed')\n"
+            "  end\n"
+            "else\n"
+            "  print('[QWAK] Model failed to load after 500ms')\n"
+            "end\n"
+            "SetModelAsNoLongerNeeded(h)\n",
+            g_spawnModel, sp.x+5.f, sp.y, sp.z+1.f);
         Log("[Spawn] *** CALLING ExecLua() ***");
         ExecLua(lua);
         Log("[Spawn] ========== COMPLETE ==========\n");
