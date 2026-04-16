@@ -408,9 +408,11 @@ static std::string g_luaQueue;
 using LuaLBX_t  = int(__fastcall*)(void*,const char*,size_t,const char*,const char*);
 using LuaPcall_t = int(__fastcall*)(void*,int,int,int,int);
 
-static uintptr_t g_fnLuaLoad    = 0;  // lua_load internal (LTO-surviving, replaces luaL_loadbufferx)
-static uintptr_t g_fnLuaSettop  = 0;  // lua_settop (state-capture via VEH+HWBP)
+static uintptr_t g_fnLuaLoad         = 0;  // lua_load internal (LTO-surviving, replaces luaL_loadbufferx)
+static uintptr_t g_fnLuaSettop       = 0;  // lua_settop (state-capture via VEH+HWBP)
+static uintptr_t g_fnLuaRpmallocState = 0; // lua_rpmalloc_state (get Lua state directly)
 using LuaLoad_t = int(__fastcall*)(void* L, const char*(*reader)(void*,void*,size_t*), void* ud, const char* name, const char* mode);
+using LuaRpmallocState_t = void*(__fastcall*)();
 struct LuaLoadS { const char* buf; size_t sz; };
 static const char* LuaGetS(void* /*L*/, void* ud, size_t* sz) {
     LuaLoadS* s = (LuaLoadS*)ud;
@@ -1102,6 +1104,15 @@ static void ScanLuaFunctions() {
             }
         }
     }
+
+    // Get lua_rpmalloc_state export to obtain Lua state directly
+    if(!g_fnLuaRpmallocState && g_hLuaDll) {
+        g_fnLuaRpmallocState = (uintptr_t)GetProcAddress(g_hLuaDll, "?lua_rpmalloc_state@LuaStateHolder@fx@@CAPEAUlua_State@@AEAPEAX@Z");
+        if(g_fnLuaRpmallocState) {
+            Log("[Lua] lua_rpmalloc_state found at DLL+0x%llX",
+                (unsigned long long)(g_fnLuaRpmallocState - (uintptr_t)g_hLuaDll));
+        }
+    }
 }
 
 static int __fastcall HkLuaLoadBufX(void* L, const char* buf, size_t sz,
@@ -1406,42 +1417,61 @@ static void ExecLua(const char* code){
 
     if(!g_fnLuaLoadBuf) { Log("[Lua] No loadbufferx found"); FLog("ABORT: no loadbufferx"); return; }
     if(!g_fnLuaPcall)   { Log("[Lua] No pcall found"); FLog("ABORT: no pcall"); return; }
-    if(!g_fnLuaSettop)  { Log("[Lua] Warning: no settop -- error stack cleanup disabled"); FLog("Warning: no settop"); }
-    // Ensure VEH handler is installed before arming any breakpoint
-    if(!g_vehHandle) {
-        g_vehHandle = AddVectoredExceptionHandler(1, LuaVehHandler);
-        Log("[Lua] VEH handler installed (from ExecLua)");
-        FLog("VEH installed from ExecLua");
+
+    // Try to get Lua state directly from rpmalloc_state export
+    void* L = nullptr;
+    if(!g_luaState && g_fnLuaRpmallocState) {
+        L = ((LuaRpmallocState_t)g_fnLuaRpmallocState)();
+        if(L) {
+            g_luaState = L;
+            Log("[Lua] Obtained state from rpmalloc_state: %p", L);
+            FLog("Got state from rpmalloc: %p", L);
+        } else {
+            Log("[Lua] rpmalloc_state returned NULL");
+        }
+    } else if(g_luaState) {
+        L = g_luaState;
+        Log("[Lua] Using cached state: %p", L);
     }
-    if(!g_vehHandle) { Log("[Lua] VEH install FAILED"); FLog("ABORT: VEH install failed"); return; }
 
-    InitTrampoline();
-    if(!g_trampCode) { Log("[Lua] Trampoline alloc failed"); FLog("ABORT: no trampoline"); return; }
+    if(!L) {
+        Log("[Lua] ERROR: No Lua state available (cached=%p, rpmalloc=%llX)",
+            g_luaState, (unsigned long long)g_fnLuaRpmallocState);
+        FLog("ABORT: No Lua state");
+        return;
+    }
 
-    // Build pcall-wrapped code buffer
+    // Build code buffer with error handling
     std::string buf = "local _ok,_er=pcall(function()\n";
     buf += code;
     buf += "\nend) if not _ok then print('[QWAK] '..tostring(_er)) end\n";
 
-    // Store in pre-allocated buffer (render thread — safe to malloc here)
-    if(g_luaExecBuf) { free(g_luaExecBuf); g_luaExecBuf = nullptr; }
-    g_luaExecBuf = (char*)malloc(buf.size() + 1);
-    if(!g_luaExecBuf) { Log("[Lua] malloc failed"); FLog("ABORT: malloc failed"); return; }
-    memcpy(g_luaExecBuf, buf.c_str(), buf.size() + 1);
-    g_luaExecSz = buf.size();
+    // Call luaL_loadbufferx directly
+    int loadRet = ((LuaLBX_t)g_fnLuaLoadBuf)(L, buf.c_str(), buf.size(), "=exec", nullptr);
+    Log("[Lua] loadbufferx returned: %d", loadRet);
+    FLog("loadbufferx=%d", loadRet);
 
-    Log("[Lua] Queued %zu bytes for Lua thread (state=%p)", buf.size(), g_luaState);
-    FLog("Queued %zu bytes, state=%p", buf.size(), g_luaState);
-    g_luaExecPending = true;
-    if(g_usingMetadataLua) {
-        // metadata-lua pcall is only invoked during resource loading, never on a Lua tick.
-        // Use settop (from scripting-lua) as the trigger — it fires every frame.
-        if(!g_fnLuaSettop) { Log("[Lua] No settop trigger available"); FLog("ABORT: no settop trigger"); g_luaExecPending = false; return; }
-        SetHardwareBP(g_fnLuaSettop);
-        Log("[Lua] BP armed on settop (%llX) for deferred exec (metadata-lua path)", (unsigned long long)g_fnLuaSettop);
+    if(loadRet == 0) {
+        // Call lua_pcall to execute
+        using Pcallk_t = int(__fastcall*)(void*,int,int,int,intptr_t,void*);
+        int pcRet = ((Pcallk_t)g_fnLuaPcall)(L, 0, 0, 0, 0, nullptr);
+        Log("[Lua] pcall returned: %d", pcRet);
+        FLog("pcall=%d", pcRet);
+
+        if(pcRet != 0 && g_fnLuaSettop) {
+            // Pop error from stack
+            using Settop_t = void(__fastcall*)(void*, int);
+            ((Settop_t)g_fnLuaSettop)(L, -2);
+            Log("[Lua] Cleared error from stack");
+        }
     } else {
-        SetHardwareBP(g_fnLuaPcall);
-        Log("[Lua] BP armed on pcallk (%llX) for deferred exec", (unsigned long long)g_fnLuaPcall);
+        // Load failed — pop error
+        if(g_fnLuaSettop) {
+            using Settop_t = void(__fastcall*)(void*, int);
+            ((Settop_t)g_fnLuaSettop)(L, -2);
+        }
+        Log("[Lua] Load FAILED: %d", loadRet);
+        FLog("Load FAILED: %d", loadRet);
     }
 }
 static bool g_gameReady     = false;
