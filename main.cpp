@@ -411,6 +411,7 @@ using LuaPcall_t = int(__fastcall*)(void*,int,int,int,int);
 static uintptr_t g_fnLuaLoad         = 0;  // lua_load internal (LTO-surviving, replaces luaL_loadbufferx)
 static uintptr_t g_fnLuaSettop       = 0;  // lua_settop (state-capture via VEH+HWBP)
 static uintptr_t g_fnLuaRpmallocState = 0; // lua_rpmalloc_state (get Lua state directly)
+static HANDLE    g_luaThread         = nullptr; // handle to scripting thread (captured when settop fires)
 using LuaLoad_t = int(__fastcall*)(void* L, const char*(*reader)(void*,void*,size_t*), void* ud, const char* name, const char* mode);
 using LuaRpmallocState_t = void*(__fastcall*)();
 struct LuaLoadS { const char* buf; size_t sz; };
@@ -1180,8 +1181,9 @@ static void FLog(const char* fmt, ...) {
 
 // DoLuaDeferred / InitTrampoline — implementations (forward-declared above)
 static void DoLuaDeferred() {
-    void* L = (void*)g_trampL;
-    FLog("DoLuaDeferred: L=%p sz=%zu", L, g_luaExecSz);
+    // g_trampL is set by the trampoline path; when called directly via APC it's 0
+    void* L = g_trampL ? (void*)g_trampL : g_luaState;
+    FLog("DoLuaDeferred: L=%p (trampL=%p luaState=%p) sz=%zu", L, (void*)g_trampL, g_luaState, g_luaExecSz);
     if(!L || !g_luaExecBuf || !g_luaExecSz
        || !g_fnLuaLoadBuf || !g_fnLuaPcall) {
         FLog("DoLuaDeferred: SKIP (L=%p buf=%p sz=%zu lbx=%llX pc=%llX)",
@@ -1320,6 +1322,12 @@ static LONG CALLBACK LuaVehHandler(PEXCEPTION_POINTERS pEx) {
             if(L && !g_luaState) {
                 g_luaState = L;
                 Log("[Lua] State captured: %p", L);
+                // Capture scripting thread handle for QueueUserAPC
+                if(!g_luaThread) {
+                    g_luaThread = OpenThread(THREAD_SET_CONTEXT, FALSE, GetCurrentThreadId());
+                    FLog("Scripting thread: %lu handle=%p", GetCurrentThreadId(), g_luaThread);
+                    Log("[Lua] Scripting thread handle captured (tid=%lu)", GetCurrentThreadId());
+                }
             }
 
             if(g_luaExecPending && g_trampCode && L) {
@@ -1456,17 +1464,24 @@ static void ExecLua(const char* code){
     FLog("Queued %zu bytes, state=%p", buf.size(), g_luaState);
 
     g_luaExecPending = true;
-    if(g_usingMetadataLua) {
-        if(!g_fnLuaSettop) { Log("[Lua] No settop for metadata-lua path"); FLog("ABORT: no settop"); g_luaExecPending = false; return; }
-        SetHardwareBP(g_fnLuaSettop);
-        Log("[Lua] BP armed on settop for deferred exec");
-    } else {
-        SetHardwareBP(g_fnLuaPcall);
-        Log("[Lua] BP armed on pcall for deferred exec");
+
+    // Primary: QueueUserAPC on the scripting thread (fires at next alertable wait)
+    if(g_luaThread) {
+        DWORD result = QueueUserAPC([](ULONG_PTR) { DoLuaDeferred(); }, g_luaThread, 0);
+        if(result) {
+            Log("[Lua] QueueUserAPC dispatched to scripting thread");
+            FLog("QueueUserAPC OK");
+            g_luaExecPending = false;
+            return;
+        }
+        Log("[Lua] QueueUserAPC failed (%lu), falling back to BP", GetLastError());
+        FLog("QueueUserAPC FAILED: %lu", GetLastError());
     }
-    // BP will fire on the next natural call from the Lua scripting thread.
-    // Do NOT call lua_settop from here — that would run DoLuaDeferred on the
-    // render thread, which causes garbage returns from Lua API (not thread-safe).
+
+    // Fallback: BP hijack — fires on next natural Lua call from scripting thread
+    if(!g_fnLuaSettop) { Log("[Lua] No settop for BP fallback"); FLog("ABORT: no settop"); g_luaExecPending = false; return; }
+    SetHardwareBP(g_fnLuaSettop);
+    Log("[Lua] BP armed on settop (APC unavailable, waiting for natural call)");
 }
 static bool g_gameReady     = false;
 
